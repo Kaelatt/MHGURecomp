@@ -85,7 +85,7 @@ int main(int argc, char **argv) {
     assert(strstr(text, "Language = Spanish") && strstr(text, "ButtonIcons = PlayStation"));
     // Invalid edits must leave both the file and the live audio setting intact.
     Config bad=c;bad.menu_confirm=3;assert(!config_save(&bad,error,sizeof error));
-    bad=c;bad.menu_scale=99;assert(!config_save(&bad,error,sizeof error));
+    bad=c;bad.menu_scale=49;assert(!config_save(&bad,error,sizeof error));
     bad.menu_scale=201;assert(!config_save(&bad,error,sizeof error));
     bad = c; bad.button_icons = 3;
     assert(!config_save(&bad, error, sizeof error));
@@ -122,6 +122,14 @@ int main(int argc, char **argv) {
     assert(config_restart_key("RenderResolution") && !config_restart_key("FOV"));
     assert(!config_restart_key("MSAA") && !config_restart_key("VSync") && !config_restart_key("FaceButtons"));
     assert(config_restart_key("framerate") == config_restart_key("FPS") && !config_restart_key("NoSuchKey"));
+    // The menu's help: the default ini's comments, wrapped lines joined, the default last (none when empty)
+    char help[2048];
+    assert(config_help("FPS", help, sizeof help) && !strcmp(help, "Framerate cap\nBetween 30 and 240\nDefault: 60"));
+    assert(config_help("3Players", help, sizeof help) && !strncmp(help, "Playercount-specific HP multipliers", 35));
+    assert(config_help("Server", help, sizeof help) && strstr(help, " and Search Hubs shows") && !strstr(help, "Default"));
+    assert(config_help("Key", help, sizeof help) && !strncmp(help, "Matchmaking key:", 16));
+    assert(config_help("DrawDistance", help, sizeof help) && strstr(help, "twice as far, 0.5 half") && strstr(help, "\nBetween 0"));
+    assert(!config_help("NoSuchKey", help, sizeof help));
     // A second save must not append duplicate sections or change resolved Auto settings.
     assert(config_save(&loaded, error, sizeof error));
     after = read_file(path); assert(!strcmp(text, after)); free(text); free(after);
@@ -147,6 +155,7 @@ int main(int argc, char **argv) {
     assert(config_defaults().draw_distance==1.0f);
     assert(config_defaults().mute_in_background==0);
     assert(config_defaults().combo_window==COMBO_LENIENT);
+    assert(config_defaults().fxaa_mode==FXAA_ORIGINAL);
     fsr_config.fsr=1;fsr_config.fsr_upscaler=FSR_UP_4;fsr_config.fsr_quality=FSR_BALANCED;
     fsr_config.fsr_sharpness=.65f;fsr_config.fsr_objmotion=0;fsr_config.fsr_reactive=.35f;fsr_config.fsr_animsurf=0;
     fsr_config.msaa=8;fsr_config.fxaa=1;
@@ -177,7 +186,44 @@ int main(int argc, char **argv) {
     fsr_saved.fsr=0;assert(config_save(&fsr_saved,error,sizeof error));
     assert(config_live_msaa()==1 && config_live_fxaa()==0); // Remains active until restart.
     g_config=initial;config_load();assert(config_live_msaa()==8 && config_live_fxaa()==1);
+    // [Keybinds]: SDL's key names, the mouse's, Comma for ','; up to two or None; the recomp's own keys refused
+    Config keys = config_editable();
+    assert(keys.binds[BIND_X][0] == KEY_MOUSE + SDL_BUTTON_LEFT && keys.binds[BIND_PLUS][1] == SDL_SCANCODE_KP_ENTER);
+    assert(config_live_bind(BIND_MOVE_UP, 0) == SDL_SCANCODE_W && config_live_bind(BIND_A, 0) == KEY_MOUSE + SDL_BUTTON_RIGHT);
+    const ConfigSetting *bind_b = config_bind_setting(BIND_B);
+    assert(bind_b && !strcmp(bind_b->key, "B") && config_setting("leftstickclick") == config_bind_setting(BIND_LSTICK));
+    char value[256];
+    assert(config_parse(bind_b, " comma ,Mouse 5", &keys) && keys.binds[BIND_B][0] == SDL_SCANCODE_COMMA &&
+           keys.binds[BIND_B][1] == KEY_MOUSE + SDL_BUTTON_X2);
+    config_format(bind_b, &keys, value, sizeof value); assert(!strcmp(value, "Comma, Mouse 5"));
+    {  // the wheel: a key of its own, on the item bar by default
+        Config wheel = keys;
+        assert(config_editable().binds[BIND_ITEM_LEFT][0] == KEY_WHEEL_UP && !config_editable().binds[BIND_ITEM_LEFT][1]);
+        assert(config_editable().binds[BIND_ITEM_RIGHT][0] == KEY_WHEEL_DOWN);
+        assert(config_editable().binds[BIND_Y][1] == KEY_MOUSE + SDL_BUTTON_MIDDLE);
+        assert(config_setting("itemleft") == config_bind_setting(BIND_ITEM_LEFT));
+        assert(config_parse(bind_b, "wheel down, Mouse 4", &wheel) && wheel.binds[BIND_B][0] == KEY_WHEEL_DOWN &&
+               wheel.binds[BIND_B][1] == KEY_MOUSE + SDL_BUTTON_X1);
+        config_format(bind_b, &wheel, value, sizeof value); assert(!strcmp(value, "Wheel Down, Mouse 4"));
+    }
+    Config parsed = keys;
+    assert(!config_parse(bind_b, "F12", &keys) && !config_parse(bind_b, "Escape", &keys) && !config_parse(bind_b, ",", &keys));
+    assert(!config_parse(bind_b, "A, B, C", &keys) && !config_parse(bind_b, "NoSuchKey", &keys));
+    assert(!memcmp(keys.binds, parsed.binds, sizeof keys.binds));  // (a value it doesn't take leaves the keys alone)
+    assert(config_parse(bind_b, "None", &keys) && !keys.binds[BIND_B][0] && !keys.binds[BIND_B][1]);
+    config_format(bind_b, &keys, value, sizeof value); assert(!strcmp(value, "None"));
+    keys.binds[BIND_B][0] = SDL_SCANCODE_F;
+    assert(config_save(&keys, error, sizeof error) && config_live_bind(BIND_B, 0) == SDL_SCANCODE_F);
+    text = read_file(path);
+    // (the section added to the file has the platform's line ends)
+    assert((strstr(text, "\nB = F\r\n") || strstr(text, "\nB = F\n")) && strstr(text, "\nPlus = Return, Keypad Enter"));
+    free(text);
+    bad = keys; bad.binds[BIND_A][1] = SDL_SCANCODE_F1; assert(!config_save(&bad, error, sizeof error));
+    bad = keys; bad.binds[BIND_A][1] = KEY_MOUSE + 9; assert(!config_save(&bad, error, sizeof error));
+    g_config = initial; config_load();
+    assert(config_editable().binds[BIND_B][0] == SDL_SCANCODE_F && !config_editable().binds[BIND_B][1]);
+    assert(config_editable().binds[BIND_RSTICK][1] == SDL_SCANCODE_RALT);
     remove(path);
-    puts("PASS: INI round trip, Auto/Desktop, environment overrides, comments/unknown keys, duplicate aliases, quest removal, invalid input, atomic write failure, live volume and English/Spanish, icons, hot settings and restart classification.");
+    puts("PASS: INI round trip, Auto/Desktop, environment overrides, comments/unknown keys, duplicate aliases, quest removal, invalid input, atomic write failure, live volume and English/Spanish, icons, hot settings, keybinds and restart classification.");
     return 0;
 }

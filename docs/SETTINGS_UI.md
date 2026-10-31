@@ -3,27 +3,40 @@
 Minus + Plus (Back/Select + Start) or F1 opens a single panel inside the game.
 Insert still opens Forge. Options, Save and Reset share one scrolling flow, in that order.
 Back appears only as a guide beneath the options. Discard is available only
-in the unsaved-changes confirmation when leaving the menu. App also contains Restart and Exit. The panel is attached on
+in the unsaved-changes confirmation when leaving the menu. Menu Options also contains Restart and Exit. The panel is attached on
 every opening; detach allows dragging, and Move menu works with the controller.
 
 Shoulder glyphs bracket the tab labels at the top. The tab header stays pinned
 inside the panel, remains clickable while scrolled and never overlaps option
 selection. Only the options/actions between the header and hints scroll. The bottom guide labels
 the D-pad as Navigation, the confirm button as Confirm, and the back button
-as Back, using the selected controller layout and language.
+as Back, using the selected controller layout and English/Spanish language.
 The guide wraps when needed and stays pinned inside the bottom of the panel.
 Long option lists scroll above it, including Save and Reset; focused rows scroll
 fully clear of the guide.
 
 ## Navigation and editing
 
-L/R cycles eight tabs once per press and selects their first field. The tabs are
-Display, Graphics & Audio, Controls, Network, Miscellaneous, Mods, Cheats and App. Miscellaneous
-contains the monster-HP multipliers and quest-specific overrides. D-pad or
+L/R cycles seven tabs once per press and selects their first field. The tabs are
+Display, Graphics & Audio, Controls, Network, Misc, Mods and Menu Options. Misc
+contains the monster-HP multipliers (under a "Monster HP Scaling" title: a header row,
+skipped by navigation) and quest-specific overrides. D-pad or
 left stick moves between rows; left/right adjusts the selected value. Confirm
-opens a choice list or the host-address text editor. Numeric rows adjust
-directly with left/right; clicking or confirming them never opens a keypad. Each compound setting has
+opens the host-address text editor, or a dropdown on rows with choices (an arrow after
+their value): their choices in a small window of its own under the row (above it when
+there is more room there), the current one marked by a bar. Up/down move in it,
+Confirm picks, Back or a click elsewhere closes it. Numeric rows adjust
+directly with left/right; clicking or confirming them never opens a keypad, except
+the frame rate, whose Confirm opens a dropdown of 30, 60, 90, 120, 150 and 240 (left/right
+still go one frame at a time). Each compound setting has
 one focus stop per editable value. Mouse and physical keyboard remain supported.
+
+Above the guides, a pinned help box explains the row last focused or pointed at with
+the mouse: the comment lines above its key in the default ini (`config.c` DEFAULT_INI,
+`config_help`; wrapped lines joined, "Default: x" last), or a text of the row's own
+(Per-quest overrides, Check hub server). It keeps room for the longest help of the tab,
+so moving between rows doesn't move the guides. The ini's text is English; each line goes
+through `settings_locale.h`, so a translation added there is used.
 
 Back, Escape and F1/chord share a single-level route: cancel an editor, cancel a
 confirmation, or leave the main panel. The panel owns its navigation keys before
@@ -64,7 +77,7 @@ as the player wrote it ("21:9", "Borderless Window"). Every setting is one row o
 writing and checking the file, and the asterisks and number ranges here, all come from it. A new setting is a row
 there, a line in the default file text (`DEFAULT_INI`) and a row in this menu.
 
-App offers seven languages (English, Français, Español, Deutsch, Italiano, Traditional_Chinese, Simplified_Chinese) and interface scale 100–200% (`MenuScale` under
+Menu Options offers English/Spanish and interface scale 50–200% (`MenuScale` under
 `[Application]`). The root scales with font/DPI, is bounded by the viewport and
 keeps its top position when conditional fields appear. Tabs wrap to two rows
 when needed. Labels wrap; long values truncate without horizontal scrolling.
@@ -72,32 +85,17 @@ Focus has both a filled background and a bright outline; the active tab has an
 underline. The full panel scrolls, including actions; no nested scroll region is
 required.
 
-## Cheats tab
-
-The Cheats tab lists every cheat loaded from the `cheats` folder, showing whether
-each cheat is On or Off, with master codes marked (`{Name}`).
-
-Cheats apply immediately when toggled without requiring Save or a restart:
-- Switching a cheat on runs its operations immediately. A cheat that writes into
-  executable game code routes that function into the interpreter (`dispatch_interpret`).
-- Each cheat maintains an open-addressing journal of byte writes (`jt`). Switching a
-  cheat off restores any bytes that still match the cheat's written values while
-  leaving memory reused by the game alone.
-- "Turn all cheats off" disables all cheats at once.
-- Toggle choices are saved and remembered across sessions in `cheats/cheats_state.ini`.
-  Files prefixed with `_` load in the disabled state by default. Resetting the section
-  re-enables non-`_` cheats and disables `_` cheats.
-
 ## Validation
 
-`make test-settings-locale` checks host UI translation coverage across all supported languages (English, Français, Español, Deutsch, Italiano, Traditional_Chinese, Simplified_Chinese), duplicate catalog entries, and nonempty translations.
+`make test-settings-locale` checks host UI translation coverage across all supported languages 
+(English, Français, Español, Deutsch, Italiano, Traditional_Chinese, Simplified_Chinese), duplicate catalog entries, and nonempty translations.
 
 `make test-settings` covers INI round trips, MenuScale bounds, Auto/Desktop,
 environment values, comments, aliases, quest removal, invalid input, failed
 writes and live settings.
 
 `make test-settings-panel` drives real ImGui without game files or a graphics
-device: eight tabs and shoulder repeat, first-field focus, editor cancellation,
+device: six tabs and shoulder repeat, first-field focus, editor cancellation,
 origin restoration, dirty close guards, inactive former save/discard shortcuts, no ImGui
 windowing on held face buttons, failed writes, numeric activation without a keypad, pending text during
 close, explicit exit/restart, quest addition/removal/reset, 200% Spanish layout,

@@ -4,7 +4,9 @@
 #include "settings_locale.h"
 #include "settings_icons.h"
 #include "app_actions.h"
+#include "cheats.h"
 #include "overlay.h"
+#include "keymap.h"
 #include "modorder.h"
 #include "cheats_ui.h"
 #include "net/net.h"
@@ -26,11 +28,14 @@
 #include <vector>
 
 namespace {
-enum class View { Main, Choices, Keyboard, CloseChanges, Exit, Restart, Reset, Move, Conflicts };
+enum class View { Main, Keyboard, CloseChanges, Exit, Restart, Reset, Move, Conflicts, KeyCapture, Keybinds };
 enum class Command { None, Save };
 struct Row {
     std::string id, title, value;
-    bool enabled = true, cold = false, action = false;
+    std::string key, help;  // its ini key (config.c g_settings; its help: config_help), or a help text of its own
+    bool enabled = true, cold = false, action = false, warn = false;
+    bool header = false, current = false;  // a section title (not a row to select); the choice a dropdown has now
+    bool menu = false;                     // Confirm opens a dropdown of its choices
     std::function<void(int)> adjust;
     std::function<void()> activate;
 };
@@ -44,11 +49,15 @@ struct Origin {
     std::string focus;
     float scroll;
 };
-struct Choice {
+// A row's choices, listed in a window of their own under it (or above it, near the bottom) while it is open: the
+// controller moves in the list, Confirm picks, Back or a click elsewhere closes it
+struct Dropdown {
+    bool open = false, hovered = false, anchored = false;
+    std::string row;  // the row it belongs to
     std::vector<std::string> names;
-    int selected;
+    int selected = 0;
     std::function<void(int)> set;
-    std::string title;
+    ImRect anchor;  // that row on the screen, this frame (draw_rows)
 };
 struct Keyboard {
     std::string title, original, buffer;
@@ -63,18 +72,31 @@ struct State {
     View view = View::Main;
     Command command = Command::None;
     std::string focus, error;
+    std::string help_row, hovered;  // the row whose help shows (the one focused or pointed at last); the one pointed at
+    bool pointing = false;          // the mouse pointer is on one of the view's rows (hovered: also the focused one)
+    float help_height = 0;          // room for the longest help of the tab (last frame's)
     std::vector<Target> targets;
     std::vector<Origin> origins;
-    Choice choice;
+    Dropdown dropdown;
     Keyboard keyboard;
     uint64_t quest_keys[HP_QUESTS_MAX] = {}, next_quest_key = 1;
     bool restore_scroll = false;
     float scroll = 0, guide_height = 0;
     int focus_scroll_frames = 0;
     ImVec2 move_start = {}, move_position = {};
+    // The mouse: dragging the top of the menu moves it, the grip at its bottom right corner sizes it (custom_size,
+    // 0: as tall as its rows, as wide as it is by default); either one detaches it
+    ImVec2 custom_size = {}, drag_mouse = {}, drag_from = {};
+    int dragging = 0;  // 1 moving, 2 sizing
+    bool dragged = false;  // (the press moved the menu: the tab under it is not chosen when it lets go)
+    float header_bottom = 0;  // (the top part that moves the menu, from the window's top: last frame's)
     bool position_override = false;
+    int capture_bind = -1;     // the keybind (BIND_*) a key is being chosen for; -1: the chat key
+    bool capture_add = false;  // the key chosen is that keybind's second, else its only one
 } s;
-std::atomic<bool> request_exit, request_back, is_dirty, is_confirming;
+std::atomic<bool> request_exit, request_back, is_dirty, is_confirming, is_capturing, capture_mouse, capture_wheel;
+// (the key pressed while a key is being chosen, or KEY_MOUSE + a mouse button; -1: none yet)
+std::atomic<int> captured_key{-1};
 const char *tr(const char *text) { return settings_text(s.draft.language, text); }
 std::string fmt(const char *text, ...) {
     char buffer[512];
@@ -84,6 +106,41 @@ std::string fmt(const char *text, ...) {
     va_end(args);
     return buffer;
 }
+// The menu's colours ([Application] Theme, applied as it is picked): Blue, the original look; Gold, a warm panel
+// where rows light up with a gold bar at their left instead of a frame, and tabs that are only their names,
+// underlined; and Hunter, after the game's own windows (the item pouch) - a maroon panel with a red and green rule at
+// its top and bottom, gold corners, rows split by lines and the focused one filled gold.
+struct Theme {
+    ImU32 panel, edge, row, row_hover, row_focus, tab, tab_active, accent, accent_bright, text, text_dim, text_off,
+        warn, divider, popup;
+    bool bar;         // the focused row: lit with a bar at its left (else framed)
+    float rounding;   // of the window, the rows and the tabs
+    bool game;        // Hunter: the game's window frame (draw_frame), lines between the rows, a filled header
+    ImU32 header;     // (game: the header band's colour)
+};
+const Theme &theme() {
+    static const Theme blue = {IM_COL32(6, 10, 17, 250),     IM_COL32(110, 217, 255, 255), IM_COL32(23, 33, 48, 255),
+                               IM_COL32(38, 71, 99, 255),    IM_COL32(41, 82, 117, 255),   IM_COL32(15, 23, 36, 255),
+                               IM_COL32(46, 102, 143, 255),  IM_COL32(111, 216, 255, 255), IM_COL32(111, 216, 255, 255),
+                               IM_COL32(244, 247, 252, 255), IM_COL32(178, 192, 208, 255), IM_COL32(132, 145, 160, 255),
+                               IM_COL32(255, 184, 145, 255), IM_COL32(52, 72, 94, 255),    IM_COL32(13, 20, 31, 255),
+                               false,                        3.f};
+    static const Theme gold = {IM_COL32(34, 25, 19, 248),    IM_COL32(139, 97, 40, 255),   IM_COL32(251, 236, 206, 10),
+                               IM_COL32(229, 195, 126, 28),  IM_COL32(213, 162, 79, 64),   IM_COL32(0, 0, 0, 0),
+                               IM_COL32(0, 0, 0, 0),         IM_COL32(213, 162, 79, 255),  IM_COL32(247, 226, 162, 255),
+                               IM_COL32(242, 216, 170, 255), IM_COL32(175, 150, 128, 255), IM_COL32(124, 107, 90, 255),
+                               IM_COL32(210, 106, 80, 255),  IM_COL32(139, 97, 40, 90),    IM_COL32(42, 31, 23, 252),
+                               true,                         6.f};
+    static const Theme hunter = {IM_COL32(50, 25, 24, 236),    IM_COL32(0, 0, 0, 255),       IM_COL32(0, 0, 0, 0),
+                                 IM_COL32(255, 255, 255, 20),  IM_COL32(176, 145, 24, 235),  IM_COL32(0, 0, 0, 0),
+                                 IM_COL32(0, 0, 0, 0),         IM_COL32(236, 212, 44, 255),  IM_COL32(255, 232, 84, 255),
+                                 IM_COL32(242, 238, 232, 255), IM_COL32(196, 176, 166, 255), IM_COL32(132, 112, 106, 255),
+                                 IM_COL32(255, 96, 72, 255),   IM_COL32(96, 88, 88, 255),    IM_COL32(56, 28, 27, 250),
+                                 false,                        0.f,                          true,
+                                 IM_COL32(108, 46, 46, 255)};
+    return s.draft.menu_theme == THEME_BLUE ? blue : s.draft.menu_theme == THEME_HUNTER ? hunter : gold;
+}
+ImVec4 vec(ImU32 c) { return ImGui::ColorConvertU32ToFloat4(c); }
 // The Mods tab: the mods folder's state (modorder.h), which is saved with the rest of the settings
 constexpr int PAGES = 8, MODS_PAGE = 5, CHEATS_PAGE = 6, APP_PAGE = 7;
 struct ScanResult {
@@ -106,6 +163,17 @@ bool same_mods(const std::vector<ModEntry> &a, const std::vector<ModEntry> &b) {
     return true;
 }
 bool mods_dirty() { return !same_mods(mods.draft, mods.saved); }
+// The Cheats tab: each cheat on or off (cheats.h), applied while the game runs when the settings are saved
+struct Cheats {
+    std::vector<char> draft, saved;
+} cheat_tab;
+bool cheats_dirty() { return cheat_tab.draft != cheat_tab.saved; }
+void load_cheats() {
+    cheat_tab.draft.assign(cheats_count(), 0);
+    for (int i = 0; i < cheats_count(); ++i)
+        cheat_tab.draft[i] = cheats_on(i);
+    cheat_tab.saved = cheat_tab.draft;
+}
 bool mods_restart() { return !same_mods(mods.saved, mods.boot); }
 void load_mods() {
     ModEntry all[MODS_MAX];
@@ -141,15 +209,16 @@ int mod_index(const std::string &name) {
             return i;
     return -1;
 }
+bool dirty();
 struct GuideLayout {
-    ImVec2 offset[3];
+    ImVec2 offset[4];
     float height = 0;
 };
 GuideLayout guide_layout(float width) {
     GuideLayout layout;
     float f = ImGui::GetFontSize(), x = 0, y = 0;
-    const char *labels[] = {"Navigation", "Confirm", "Back"};
-    for (int i = 0; i < 3; i++) {
+    const char *labels[] = {"Navigation", "Confirm", "Back", "Save"};
+    for (int i = 0; i < 4; i++) {
         float item_width = f * 1.4f + ImGui::CalcTextSize(tr(labels[i])).x;
         if (x && x + item_width > width) {
             x = 0;
@@ -167,15 +236,18 @@ void draw_guides(ImGuiWindow *window, const GuideLayout &layout, float top) {
     ImU32 background = ImGui::GetColorU32(ImGuiCol_WindowBg) | IM_COL32_A_MASK;
     draw->AddRectFilled(ImVec2(window->InnerRect.Min.x, top - ImGui::GetStyle().ItemSpacing.y),
                         ImVec2(window->InnerRect.Max.x, top + layout.height), background);
-    const int icons[] = {SettingsIcons::Dpad, SettingsIcons::Confirm, SettingsIcons::Back};
-    const char *labels[] = {"Navigation", "Confirm", "Back"};
+    const int icons[] = {SettingsIcons::Dpad, SettingsIcons::Confirm, SettingsIcons::Back, SettingsIcons::Save};
+    const char *labels[] = {"Navigation", "Confirm", "Back", "Save"};
     float f = ImGui::GetFontSize();
-    for (int i = 0; i < 3; i++) {
+    for (int i = 0; i < 4; i++) {
         ImVec2 pos(start.x + layout.offset[i].x, start.y + layout.offset[i].y);
+        // (Save: the top face button, Y / X / triangle - Ctrl+S on the keyboard - greyed while there is nothing to save)
         SettingsIcons::draw(draw, pos, f, s.draft.button_icons, icons[i],
-                            menu_confirm_position(config_live_menu_confirm(), overlay_face_position(0),
-                                                  overlay_face_position(1), i == 2));
-        draw->AddText(ImVec2(pos.x + f * 1.4f, pos.y), ImGui::GetColorU32(ImGuiCol_Text), tr(labels[i]));
+                            i == 3 ? 3
+                                   : menu_confirm_position(config_live_menu_confirm(), overlay_face_position(0),
+                                                           overlay_face_position(1), i == 2));
+        draw->AddText(ImVec2(pos.x + f * 1.4f, pos.y),
+                      i == 3 && !dirty() ? theme().text_off : ImGui::GetColorU32(ImGuiCol_Text), tr(labels[i]));
     }
 }
 bool confirmation() {
@@ -202,8 +274,10 @@ bool equal(const Config &a, const Config &b) {
     SAME(vsync);
     SAME(shader_prewarm);
     SAME(draw_distance);
+    SAME(smooth_gradients);
     SAME(msaa);
     SAME(fxaa);
+    SAME(fxaa_mode);
     SAME(face_buttons);
     SAME(ldn_port);
     SAME(sync_small_monsters);
@@ -218,6 +292,9 @@ bool equal(const Config &a, const Config &b) {
     SAME(volume);
     SAME(mute_in_background);
     SAME(button_icons);
+    SAME(menu_theme);
+    SAME(discord);
+    SAME(discord_hunter);
     SAME(language);
     SAME(menu_scale);
     SAME(menu_confirm);
@@ -226,7 +303,10 @@ bool equal(const Config &a, const Config &b) {
     SAME(hp.village);
     SAME(hp.quests);
 #undef SAME
-    if (strcmp(a.ldn_join, b.ldn_join) || strcmp(a.ldn_server, b.ldn_server) || strcmp(a.ldn_key, b.ldn_key))
+    if (memcmp(a.binds, b.binds, sizeof a.binds))
+        return false;
+    if (strcmp(a.ldn_join, b.ldn_join) || strcmp(a.ldn_server, b.ldn_server) || strcmp(a.ldn_key, b.ldn_key) ||
+        strcmp(a.chat_key, b.chat_key))
         return false;
     for (int n = 0; n < 4; ++n)
         if (a.hp.scale[n] != b.hp.scale[n])
@@ -240,7 +320,7 @@ bool equal(const Config &a, const Config &b) {
     }
     return true;
 }
-bool dirty() { return !equal(s.draft, s.saved) || mods_dirty(); }
+bool dirty() { return !equal(s.draft, s.saved) || mods_dirty() || cheats_dirty(); }
 bool pending_text() {
     bool editing = s.view == View::Keyboard;
     for (const auto &o : s.origins)
@@ -256,7 +336,14 @@ void focus(const std::string &id) {
     s.focus = id;
     s.focus_request = true;
 }
+void close_dropdown() {
+    if (!s.dropdown.open)
+        return;
+    s.dropdown.open = false;
+    focus(s.dropdown.row);
+}
 void push(View view, const std::string &first) {
+    s.dropdown.open = false;
     auto *root = ImGui::FindWindowByName("Settings##main");
     s.origins.push_back({s.view, s.focus, root ? root->Scroll.y : 0});
     s.view = view;
@@ -267,6 +354,7 @@ void push(View view, const std::string &first) {
     ImGui::ClearActiveID();
 }
 void pop() {
+    s.dropdown.open = false;
     if (s.origins.empty()) {
         s.view = View::Main;
         s.focus.clear();
@@ -282,6 +370,7 @@ void pop() {
     ImGui::ClearActiveID();
 }
 void first_page(int page) {
+    s.dropdown.open = false;
     s.page = page;
     s.view = View::Main;
     s.origins.clear();
@@ -294,12 +383,15 @@ void first_page(int page) {
 void discard() {
     s.draft = s.saved;
     mods.draft = mods.saved;
+    cheat_tab.draft = cheat_tab.saved;
     quest_keys();
     s.error.clear();
     s.saved_notice = false;
 }
 void ask_back(bool *open) {
-    if (s.view != View::Main) {
+    if (s.dropdown.open)
+        close_dropdown();
+    else if (s.view != View::Main) {
         if (s.view == View::Move) {
             s.move_position = s.move_start;
             s.position_override = true;
@@ -349,39 +441,48 @@ bool accept_keyboard() {
     pop();
     return true;
 }
+// The row's choices in a dropdown under it; selected: the one it has now (-1: none of them)
 void choices(const Row &row, std::vector<std::string> names, int selected, std::function<void(int)> set) {
-    s.choice = {std::move(names), selected, std::move(set), row.title};
-    push(View::Choices, "choice." + std::to_string(selected));
+    int first = std::clamp(selected, 0, (int)names.size() - 1);
+    s.dropdown = {true, false, false, row.id, std::move(names), selected, std::move(set), {}};
+    focus("choice." + std::to_string(first));
 }
-// What the settings table (config.c g_settings) says of a setting: does it need a restart, a number's range
-bool cold(const char *key) { return config_restart_key(key); }
+// What the settings table (config.c g_settings) says of a setting: does it need a restart, a number's range. ini():
+// the key a row is for (its restart mark and its help)
+const char *ini(const char *key) { return key; }
+bool cold(const char *key) { return key && config_restart_key(key); }
 float lo(const char *key) { float a = 0, b = 0; config_range(key, &a, &b); return a; }
 float hi(const char *key) { float a = 0, b = 0; config_range(key, &a, &b); return b; }
-void add_bool(std::vector<Row> &rows, const char *id, const char *name, int *value, bool cold = false) {
+void keyed(Row &r, const char *key) {
+    r.key = key ? key : "";
+    r.cold = cold(key);
+}
+void add_bool(std::vector<Row> &rows, const char *id, const char *name, int *value, const char *key = nullptr) {
     Row r;
     r.id = id;
     r.title = tr(name);
-    r.cold = cold;
+    keyed(r, key);
     r.value = tr(*value ? "On" : "Off");
     r.adjust = [value](int d) { *value = d > 0 ? 1 : 0; };
     r.activate = [value]() { *value = !*value; };
     rows.push_back(std::move(r));
 }
 void add_choice(std::vector<Row> &rows, const char *id, const char *name, int selected,
-                const std::vector<std::string> &names, std::function<void(int)> set, bool cold = false) {
+                const std::vector<std::string> &names, std::function<void(int)> set, const char *key = nullptr) {
     Row r;
     r.id = id;
     r.title = tr(name);
     r.value = names[std::clamp(selected, 0, (int)names.size() - 1)];
-    r.cold = cold;
+    keyed(r, key);
     r.adjust = [selected, names, set](int d) { set((selected + d + (int)names.size()) % (int)names.size()); };
     Row copy = r;
+    r.menu = true;
     r.activate = [copy, names, selected, set]() { choices(copy, names, selected, set); };
     rows.push_back(std::move(r));
 }
 void add_number(std::vector<Row> &rows, const std::string &id, const std::string &name,
                 std::function<double()> get, std::function<void(double)> set, double low, double high,
-                double step, bool integral, bool cold = false,
+                double step, bool integral, const char *key = nullptr,
                 std::function<bool(double, std::string &)> check = {}) {
     char text[64];
     snprintf(text, sizeof text, integral ? "%.0f" : "%.2f", get());
@@ -389,7 +490,7 @@ void add_number(std::vector<Row> &rows, const std::string &id, const std::string
     r.id = id;
     r.title = name;
     r.value = text;
-    r.cold = cold;
+    keyed(r, key);
     r.adjust = [get, set, low, high, step, check](int d) {
         double v = std::clamp(get() + d * step, low, high);
         std::string error;
@@ -407,16 +508,25 @@ void add_number(std::vector<Row> &rows, const std::string &id, const std::string
     rows.push_back(std::move(r));
 }
 void number(std::vector<Row> &r, const char *id, const char *name, int *p, int low, int high, int step = 1,
-            bool cold = false) {
+            const char *key = nullptr) {
     add_number(
         r, id, tr(name), [p]() { return (double)*p; }, [p](double v) { *p = (int)v; }, low, high, step, true,
-        cold);
+        key);
 }
 void number(std::vector<Row> &r, const std::string &id, const std::string &name, float *p, float low,
-            float high, float step, bool cold = false) {
+            float high, float step, const char *key = nullptr) {
     add_number(
         r, id, name, [p]() { return (double)*p; }, [p](double v) { *p = (float)v; }, low, high, step, false,
-        cold);
+        key);
+}
+// A section's title between the rows (not selectable)
+void header(std::vector<Row> &rows, const std::string &id, const std::string &title) {
+    Row r;
+    r.id = id;
+    r.title = title;
+    r.header = true;
+    r.enabled = false;
+    rows.push_back(std::move(r));
 }
 void action(std::vector<Row> &rows, const std::string &id, const std::string &name, std::function<void()> fn,
             bool enabled = true) {
@@ -430,13 +540,13 @@ void action(std::vector<Row> &rows, const std::string &id, const std::string &na
 }
 // A text setting (a char array of the draft, size bytes) typed on the on-screen keyboard; shown: its row's value
 void text(std::vector<Row> &rows, const char *id, const char *name, char *field, size_t size, const std::string &shown,
-          bool cold) {
+          const char *key) {
     size_t at = (size_t)(field - (char *)&s.draft);
     Row r;
     r.id = id;
     r.title = tr(name);
     r.value = shown;
-    r.cold = cold;
+    keyed(r, key);
     r.activate = [name, at, size]() {
         keyboard(tr(name), (char *)&s.draft + at, size - 1, [at, size](const std::string &typed, std::string &error) {
             Config temp = s.draft;
@@ -475,9 +585,100 @@ void hub_check(std::vector<Row> &rows) {
     Row r;
     r.id = "server.check";
     r.title = tr("Check hub server");
+    r.help = tr("Asks the hub server above whether it answers, with the matchmaking key above: how long it takes, and how many hubs it lists.");
     r.value = state;
     r.activate = []() { ldn_hub_check(s.draft.ldn_server, s.draft.ldn_key); };
     rows.push_back(std::move(r));
+}
+// The keybinds' rows (config.h BIND_*): what each is called
+const char *const bind_titles[BINDS] = {"Move forward", "Move back", "Move left", "Move right", "Walk", "A", "B", "X",
+                                        "Y", "L", "R", "ZL", "ZR", "Plus", "Minus", "D-pad up", "D-pad down",
+                                        "D-pad left", "D-pad right", "Left stick click", "Right stick click",
+                                        "Item left", "Item right"};
+// What else a key (or KEY_MOUSE + a mouse button) does: one of the recomp's own keys (keymap.h), a keybind other than
+// skip, or (for a keybind's) the chat key; nullptr: nothing
+const char *key_use(int code, int skip) {
+    if (const char *use = code < KEY_MOUSE ? key_reserved(code) : nullptr)
+        return tr(use);
+    for (int i = 0; i < BINDS; i++)
+        for (int k = 0; k < BIND_KEYS; k++)
+            if (i != skip && s.draft.binds[i][k] == code)
+                return tr(bind_titles[i]);
+    if (skip >= 0 && code == (int)SDL_GetScancodeFromName(s.draft.chat_key))
+        return tr("Chat key");
+    return nullptr;
+}
+// Choosing a key: for a keybind (BIND_*, add: its second key) or the chat key (-1)
+void capture(int bind, bool add) {
+    s.capture_bind = bind;
+    s.capture_add = add;
+    captured_key = -1;
+    push(View::KeyCapture, "capture.cancel");
+}
+// The key that opens a line of chat; red when something else already uses it
+void chat_key_row(std::vector<Row> &rows) {
+    Row r;
+    r.id = "chat.key";
+    r.title = tr("Chat key");
+    keyed(r, ini("ChatKey"));
+    SDL_Scancode key = SDL_GetScancodeFromName(s.draft.chat_key);
+    r.value = key != SDL_SCANCODE_UNKNOWN ? s.draft.chat_key : tr("None");
+    if (const char *use = key != SDL_SCANCODE_UNKNOWN ? key_use((int)key, -1) : nullptr) {
+        r.value += std::string(" (") + tr("in use:") + " " + use + ")";
+        r.warn = true;
+    }
+    r.activate = []() { capture(-1, false); };
+    rows.push_back(std::move(r));
+}
+// The Keybinds submenu: a row per keybind (its keys; red where one does something else too), the chat key
+void keybind_rows(std::vector<Row> &r) {
+    for (int i = 0; i < BINDS; i++) {
+        if (i == BIND_MOVE_UP)
+            header(r, "bind.movement", tr("Movement"));
+        if (i == BIND_A)
+            header(r, "bind.buttons", tr("Buttons"));
+        if (i == BIND_ITEM_LEFT)
+            header(r, "bind.items", tr("Item bar"));
+        Row row;
+        row.id = "bind." + std::to_string(i);
+        row.title = tr(bind_titles[i]);
+        for (int k = 0; k < BIND_KEYS; k++) {
+            int code = s.draft.binds[i][k];
+            if (!code)
+                continue;
+            row.value += (row.value.empty() ? "" : ", ") + std::string(config_key_name(code));
+            if (const char *use = key_use(code, i)) {
+                row.value += std::string(" (") + tr("in use:") + " " + use + ")";
+                row.warn = true;
+            }
+        }
+        if (row.value.empty())
+            row.value = tr("None");
+        Row copy = row;
+        row.menu = true;
+        row.activate = [copy, i]() {
+            bool one = s.draft.binds[i][0] && !s.draft.binds[i][1];
+            std::vector<std::string> names = {tr("Set key")};
+            if (one)
+                names.push_back(tr("Add a second key"));
+            names.push_back(tr("None"));
+            choices(copy, names, -1, [i, one](int v) {
+                if (v == (one ? 2 : 1))
+                    s.draft.binds[i][0] = s.draft.binds[i][1] = 0;
+                else
+                    capture(i, v == 1);
+            });
+        };
+        r.push_back(std::move(row));
+    }
+    header(r, "bind.other", tr("Chat"));
+    chat_key_row(r);
+    action(r, "bind.reset", tr("Reset keybinds"), []() {
+        Config f = config_defaults();
+        memcpy(s.draft.binds, f.binds, sizeof f.binds);
+        SDL_strlcpy(s.draft.chat_key, f.chat_key, sizeof s.draft.chat_key);
+    });
+    action(r, "bind.back", tr("Back"), []() { pop(); });
 }
 void reset_section() {
     Config f = config_defaults(), &c = s.draft;
@@ -504,8 +705,10 @@ void reset_section() {
         c.vsync = f.vsync;
         c.shader_prewarm = f.shader_prewarm;
         c.draw_distance = f.draw_distance;
+        c.smooth_gradients = f.smooth_gradients;
         c.msaa = f.msaa;
         c.fxaa = f.fxaa;
+        c.fxaa_mode = f.fxaa_mode;
         c.volume = f.volume;
         c.mute_in_background = f.mute_in_background;
         break;
@@ -516,6 +719,8 @@ void reset_section() {
         c.background_input = f.background_input;
         c.combo_window = f.combo_window;
         c.mouse_sensitivity = f.mouse_sensitivity;
+        SDL_strlcpy(c.chat_key, f.chat_key, sizeof c.chat_key);
+        memcpy(c.binds, f.binds, sizeof c.binds);
         break;
     case 3:
         c.ldn_port = f.ldn_port;
@@ -535,12 +740,13 @@ void reset_section() {
         std::sort(mods.draft.begin(), mods.draft.end(),
                   [](const ModEntry &a, const ModEntry &b) { return strcasecmp(a.name, b.name) < 0; });
         break;
-    case CHEATS_PAGE:  // back to the start: on unless the file's name starts with '_'
-        for (int i = 0; i < cheats_count(); ++i)
-            cheats_set_enabled(i, cheats_file(i)[0] != '_');
+    case CHEATS_PAGE:
+        for (int i = 0; i < (int)cheat_tab.draft.size(); ++i)
+            cheat_tab.draft[i] = 1;
         break;
     case APP_PAGE:
         c.language = f.language;
+        c.menu_theme = f.menu_theme;
         c.menu_scale = f.menu_scale;
         c.confirm_exit = f.confirm_exit;
         c.updates = f.updates;
@@ -606,6 +812,7 @@ void conflict_rows(std::vector<Row> &r) {
             Row &row = r.back();
             Row copy = row;
             copy.title = tr("Which mod is used?");
+            row.menu = true;
             row.activate = [copy, a, b]() {
                 choices(copy, {fmt("Use %s", a.c_str()), fmt("Use %s", b.c_str())}, 1, [a, b](int v) {
                     int ia = mod_index(a), ib = mod_index(b), win = v ? ib : ia, lose = v ? ia : ib;
@@ -618,6 +825,31 @@ void conflict_rows(std::vector<Row> &r) {
                 });
             };
         }
+    }
+}
+void cheat_rows(std::vector<Row> &r) {
+    if (cheat_tab.draft.empty())
+        action(r, "cheats.none", tr("No cheats found in the cheats folder"), []() {});
+    for (int i = 0; i < (int)cheat_tab.draft.size(); ++i) {
+        Row row;
+        row.id = "cheat." + std::to_string(i);
+        row.title = cheats_name(i);
+        row.help = cheats_file(i);
+        if (cheats_master(i)) {
+            row.value = tr("Always on");
+            row.enabled = false;
+        } else {
+            row.value = tr(cheat_tab.draft[i] ? "On" : "Off");
+            row.adjust = [i](int d) {
+                cheat_tab.draft[i] = d > 0;
+                s.saved_notice = false;
+            };
+            row.activate = [i]() {
+                cheat_tab.draft[i] = !cheat_tab.draft[i];
+                s.saved_notice = false;
+            };
+        }
+        r.push_back(std::move(row));
     }
 }
 void mods_rows(std::vector<Row> &r) {
@@ -651,6 +883,7 @@ void mods_rows(std::vector<Row> &r) {
         };
         row.adjust = [set_on](int d) { set_on(d > 0); };
         Row copy = row;
+        row.menu = true;
         row.activate = [copy, name, on, set_on]() {
             auto move = [name](int d) {
                 int at = mod_index(name), to = at + d;
@@ -659,7 +892,7 @@ void mods_rows(std::vector<Row> &r) {
                     s.saved_notice = false;
                 }
             };
-            choices(copy, {tr(on ? "Turn off" : "Turn on"), tr("Move up"), tr("Move down")}, 0,
+            choices(copy, {tr(on ? "Turn off" : "Turn on"), tr("Move up"), tr("Move down")}, -1,
                     [set_on, move, on](int v) {
                         if (v == 0)
                             set_on(!on);
@@ -735,17 +968,17 @@ std::vector<Row> main_rows() {
     case 0:
         add_choice(
             r, "display.mode", "Window mode", c.display_mode,
-            {tr("Windowed"), tr("Fullscreen"), tr("Borderless")}, [](int v) { c.display_mode = v; }, cold("Mode"));
+            {tr("Windowed"), tr("Fullscreen"), tr("Borderless")}, [](int v) { c.display_mode = v; }, ini("Mode"));
         add_choice(
             r, "display.auto", "Screen resolution", !c.width ? 0 : 1, {tr("Desktop"), tr("Custom")},
             [](int v) {
                 s.draft.width = v ? 1920 : 0;
                 s.draft.height = v ? 1080 : 0;
             },
-            cold("Resolution"));
+            ini("Resolution"));
         if (c.width) {
-            number(r, "display.width", "Width", &c.width, 320, 16384, 80, cold("Resolution"));
-            number(r, "display.height", "Height", &c.height, 180, 16384, 45, cold("Resolution"));
+            number(r, "display.width", "Width", &c.width, 320, 16384, 80, ini("Resolution"));
+            number(r, "display.height", "Height", &c.height, 180, 16384, 45, ini("Resolution"));
         }
         add_choice(
             r, "render.auto", "Render resolution", !c.render_w ? 0 : 1, {tr("Auto"), tr("Custom")},
@@ -753,31 +986,48 @@ std::vector<Row> main_rows() {
                 s.draft.render_w = v ? 1920 : 0;
                 s.draft.render_h = v ? 1080 : 0;
             },
-            cold("RenderResolution"));
+            ini("RenderResolution"));
         if (c.render_w) {
-            number(r, "render.width", "Width", &c.render_w, 320, 16384, 80, cold("RenderResolution"));
-            number(r, "render.height", "Height", &c.render_h, 180, 16384, 45, cold("RenderResolution"));
+            number(r, "render.width", "Width", &c.render_w, 320, 16384, 80, ini("RenderResolution"));
+            number(r, "render.height", "Height", &c.render_h, 180, 16384, 45, ini("RenderResolution"));
         }
         add_choice(
             r, "aspect.auto", "Automatic aspect ratio", c.aspect_ratio == 0 ? 0 : 1,
-            {tr("Auto"), tr("Custom")}, [](int v) { s.draft.aspect_ratio = v ? 16.f / 9 : 0; }, cold("AspectRatio"));
+            {tr("Auto"), tr("Custom")}, [](int v) { s.draft.aspect_ratio = v ? 16.f / 9 : 0; }, ini("AspectRatio"));
         if (c.aspect_ratio)
-            number(r, "aspect", tr("Aspect ratio"), &c.aspect_ratio, lo("AspectRatio"), hi("AspectRatio"), .05f, cold("AspectRatio"));
-        number(r, "fov", tr("Field of view"), &c.fov, lo("FOV"), hi("FOV"), .05f, cold("FOV"));
+            number(r, "aspect", tr("Aspect ratio"), &c.aspect_ratio, lo("AspectRatio"), hi("AspectRatio"), .05f, ini("AspectRatio"));
+        number(r, "fov", tr("Field of view"), &c.fov, lo("FOV"), hi("FOV"), .05f, ini("FOV"));
         add_choice(
             r, "anchor", "HUD anchor", c.ui_anchor - 1, {"16:9", "21:9", "32:9", tr("Edges")},
-            [](int v) { c.ui_anchor = v + 1; }, cold("UIAnchor"));
+            [](int v) { c.ui_anchor = v + 1; }, ini("UIAnchor"));
         break;
     case 1:
-        number(r, "fps", "Frame rate limit", &c.fps, (int)lo("FPS"), (int)hi("FPS"), 1, cold("FPS"));
-        add_bool(r, "vsync", "VSync", &c.vsync, cold("VSync"));
-        add_bool(r, "prewarm", "Shader prewarm", &c.shader_prewarm, cold("ShaderPrewarm"));
+        number(r, "fps", "Frame rate limit", &c.fps, (int)lo("FPS"), (int)hi("FPS"), 1, ini("FPS"));
+        {  // left / right: one frame per second more or less; Confirm: the common ones
+            static const int presets[] = {30, 60, 90, 120, 150, 240};
+            r.back().menu = true;
+            Row copy = r.back();
+            r.back().activate = [copy]() {
+                std::vector<std::string> names;
+                int now = -1;
+                for (int i = 0; i < (int)std::size(presets); i++) {
+                    names.push_back(std::to_string(presets[i]));
+                    if (presets[i] <= s.draft.fps)
+                        now = presets[i] == s.draft.fps ? i : -1 - i;  // (not one of them: start at the one below)
+                }
+                choices(copy, names, now, [](int v) { s.draft.fps = presets[v]; });
+                if (now < -1)
+                    focus("choice." + std::to_string(-1 - now));
+            };
+        }
+        add_bool(r, "vsync", "VSync", &c.vsync, ini("VSync"));
+        add_bool(r, "prewarm", "Shader prewarm", &c.shader_prewarm, ini("ShaderPrewarm"));
         add_choice(r, "msaa", "MSAA",
                    c.msaa == 8   ? 3
                    : c.msaa == 4 ? 2
                    : c.msaa == 2 ? 1
                                  : 0,
-                   {tr("Off"), "2x", "4x", "8x"}, [](int v) { c.msaa = 1 << v; });
+                   {tr("Off"), "2x", "4x", "8x"}, [](int v) { c.msaa = 1 << v; }, ini("MSAA"));
         if (g_config.fsr) {
             r.back().cold = true;
             if (c.fsr) {
@@ -785,7 +1035,16 @@ std::vector<Row> main_rows() {
                 r.back().value = tr("Off (FSR)");
             }
         }
-        add_bool(r, "fxaa", "FXAA", &c.fxaa);
+        add_bool(r, "fxaa", "FXAA", &c.fxaa, ini("FXAA"));
+        if (g_config.fsr) {
+            r.back().cold = true;
+            if (c.fsr) {
+                r.back().enabled = false;
+                r.back().value = tr("Off (FSR)");
+            }
+        }
+        add_choice(r, "fxaamode", "FXAA mode", c.fxaa_mode, {tr("Original"), "3.11"}, [](int v) { c.fxaa_mode = v; },
+                   ini("FXAAMode"));
         if (g_config.fsr) {
             r.back().cold = true;
             if (c.fsr) {
@@ -794,64 +1053,79 @@ std::vector<Row> main_rows() {
             }
         }
         number(r, "drawdist", tr("Draw distance"), &c.draw_distance, lo("DrawDistance"), hi("DrawDistance"), .25f,
-               cold("DrawDistance"));
+               ini("DrawDistance"));
         if (c.draw_distance == 0)
             r.back().value = tr("No limit");
-        number(r, "volume", "Volume (%)", &c.volume, (int)lo("Volume"), (int)hi("Volume"), 1, cold("Volume"));
-        add_bool(r, "mutebg", "Mute in background", &c.mute_in_background, cold("MuteInBackground"));
-        add_bool(r, "fsr", "FSR", &c.fsr, cold("FSR"));
+        add_bool(r, "smooth", "Smooth gradients", &c.smooth_gradients, ini("SmoothGradients"));
+        number(r, "volume", "Volume (%)", &c.volume, (int)lo("Volume"), (int)hi("Volume"), 1, ini("Volume"));
+        add_bool(r, "mutebg", "Mute in background", &c.mute_in_background, ini("MuteInBackground"));
+        add_bool(r, "fsr", "FSR", &c.fsr, ini("FSR"));
         if (c.fsr) {
             add_choice(
                 r, "fsr.provider", "Upscaler", c.fsr_upscaler, {"FSR 3.1", "FSR 4"},
-                [](int v) { s.draft.fsr_upscaler = v; }, cold("Upscaler"));
+                [](int v) { s.draft.fsr_upscaler = v; }, ini("Upscaler"));
+            if (g_fsr4_fallback && c.fsr_upscaler == FSR_UP_4 && g_config.fsr && g_config.fsr_upscaler == FSR_UP_4) {
+                r.back().value += std::string(" (") + tr("FSR 3.1 in use") + ")";  // (fsr4.c: FSR 4 didn't start)
+                r.back().warn = true;
+                r.back().help = tr(g_fsr4_fallback);
+            }
             add_choice(
                 r, "fsr.quality", "FSR quality", c.fsr_quality,
                 {tr("Native AA"), tr("Quality"), tr("Balanced"), tr("Performance"), tr("Ultra performance")},
-                [](int v) { s.draft.fsr_quality = v; }, cold("FSRQuality"));
-            number(r, "fsr.sharpness", tr("Sharpness"), &c.fsr_sharpness, lo("Sharpness"), hi("Sharpness"), .05f, cold("Sharpness"));
-            add_bool(r, "fsr.motion", "Object motion", &c.fsr_objmotion, cold("ObjectMotion"));
-            number(r, "fsr.reactive", tr("Reactive mask"), &c.fsr_reactive, lo("Reactive"), hi("Reactive"), .05f, cold("Reactive"));
-            add_bool(r, "fsr.surfaces", "Animated surfaces", &c.fsr_animsurf, cold("AnimSurf"));
+                [](int v) { s.draft.fsr_quality = v; }, ini("FSRQuality"));
+            number(r, "fsr.sharpness", tr("Sharpness"), &c.fsr_sharpness, lo("Sharpness"), hi("Sharpness"), .05f, ini("Sharpness"));
+            add_bool(r, "fsr.motion", "Object motion", &c.fsr_objmotion, ini("ObjectMotion"));
+            number(r, "fsr.reactive", tr("Reactive mask"), &c.fsr_reactive, lo("Reactive"), hi("Reactive"), .05f, ini("Reactive"));
+            add_bool(r, "fsr.surfaces", "Animated surfaces", &c.fsr_animsurf, ini("AnimSurf"));
         }
         break;
     case 2:
         add_choice(r, "face", "Face buttons", c.face_buttons, {tr("Position"), tr("Label")},
-                   [](int v) { c.face_buttons = v; }, cold("FaceButtons"));
+                   [](int v) { c.face_buttons = v; }, ini("FaceButtons"));
         add_choice(r, "menu.confirm", "Confirm button (recomp)", c.menu_confirm,
                    {tr("Original"), tr("Bottom button"), tr("Right button")},
-                   [](int v) { s.draft.menu_confirm = v; }, cold("MenuConfirm"));
+                   [](int v) { s.draft.menu_confirm = v; }, ini("MenuConfirm"));
         add_choice(r, "icons", "Button icons", c.button_icons, {"Xbox", "Switch", "PlayStation"},
-                   [](int v) { c.button_icons = v; }, cold("ButtonIcons"));
-        add_bool(r, "background", "Background input", &c.background_input, cold("BackgroundInput"));
+                   [](int v) { c.button_icons = v; }, ini("ButtonIcons"));
+        add_bool(r, "background", "Background input", &c.background_input, ini("BackgroundInput"));
         add_choice(r, "combo", "Combo input window", c.combo_window, {tr("Lenient"), tr("Strict")},
-                   [](int v) { c.combo_window = v; }, cold("ComboInputWindow"));
-        number(r, "mouse", tr("Mouse sensitivity"), &c.mouse_sensitivity, lo("MouseSensitivity"), hi("MouseSensitivity"), .05f, cold("MouseSensitivity"));
+                   [](int v) { c.combo_window = v; }, ini("ComboInputWindow"));
+        number(r, "mouse", tr("Mouse sensitivity"), &c.mouse_sensitivity, lo("MouseSensitivity"), hi("MouseSensitivity"), .05f, ini("MouseSensitivity"));
+        action(r, "keybinds", tr("Keybinds"), []() { push(View::Keybinds, "bind.0"); });
+        r.back().help = tr("The keys and mouse buttons for the Switch controller's buttons, for moving and for the item bar, and the chat key.");
         break;
     case 3:
-        number(r, "port", "Host port (TCP / UDP)", &c.ldn_port, (int)lo("Port"), (int)hi("Port"), 1, cold("Port"));
-        text(r, "hosts", "Search hosts", c.ldn_join, sizeof c.ldn_join, *c.ldn_join ? c.ldn_join : tr("LAN"), cold("Join"));
+        number(r, "port", "Host port (TCP / UDP)", &c.ldn_port, (int)lo("Port"), (int)hi("Port"), 1, ini("Port"));
+        text(r, "hosts", "Search hosts", c.ldn_join, sizeof c.ldn_join, *c.ldn_join ? c.ldn_join : tr("LAN"), ini("Join"));
         text(r, "server", "Hub server", c.ldn_server, sizeof c.ldn_server,
              !*c.ldn_server ? std::string(tr("Default")) + (*LDN_DEFAULT_SERVER ? " (" LDN_DEFAULT_SERVER ")" : "")
                             : c.ldn_server,
-             cold("Server"));
-        text(r, "key", "Matchmaking key", c.ldn_key, sizeof c.ldn_key, *c.ldn_key ? c.ldn_key : tr("Public"), cold("Key"));
+             ini("Server"));
+        text(r, "key", "Matchmaking key", c.ldn_key, sizeof c.ldn_key, *c.ldn_key ? c.ldn_key : tr("Public"), ini("Key"));
         hub_check(r);
-        add_bool(r, "sync", "Sync small monsters", &c.sync_small_monsters, cold("SyncSmallMonsters"));
-        add_bool(r, "village", "Village quests in Hub", &c.village_in_hub, cold("VillageQuestsInHub"));
+        add_bool(r, "sync", "Sync small monsters", &c.sync_small_monsters, ini("SyncSmallMonsters"));
+        add_bool(r, "village", "Village quests in Hub", &c.village_in_hub, ini("VillageQuestsInHub"));
+        header(r, "discord.header", "Discord");
+        add_bool(r, "discord", "Discord Rich Presence", &c.discord, ini("RichPresence"));
+        add_bool(r, "discord.hunter", "Show hunter name and HR", &c.discord_hunter, ini("ShowHunter"));
         break;
-    case 4:
+    case 4: {
+        const char *per_quest =
+            tr("HP multipliers for single quests, by their quest ID: in those quests they are used instead of the ones above.");
+        header(r, "hp.header", tr("Monster HP Scaling"));
         for (int i = 0; i < 4; i++)
             number(r, "hp." + std::to_string(i), std::to_string(i + 1) + " " + tr(i == 0 ? "Hunter" : "Hunters"), &c.hp.scale[i],
-                   lo("1Player"), hi("1Player"), .05f, cold("1Player"));
-        number(r, "hp.village", tr("Village HP multiplier"), &c.hp.village, lo("HubHP"), hi("HubHP"), .05f,
-               cold("HubHP"));
+                   lo("1Player"), hi("1Player"), .05f, ini("1Player"));
+        number(r, "hp.village", tr("Village quests in Hub"), &c.hp.village, lo("HubHP"), hi("HubHP"), .05f,
+               ini("HubHP"));
         action(r, "hp.advanced", tr("Per-quest overrides"), []() { s.advanced = !s.advanced; });
+        r.back().help = per_quest;
         if (s.advanced) {
             for (int i = 0; i < c.hp.quests; i++) {
                 auto id = quest_id(i);
                 add_number(
                     r, id, tr("Quest ID"), [i]() { return (double)s.draft.hp.quest[i].quest; },
-                    [i](double v) { s.draft.hp.quest[i].quest = (uint32_t)v; }, 1, 4294967295., 1, true, true,
+                    [i](double v) { s.draft.hp.quest[i].quest = (uint32_t)v; }, 1, 4294967295., 1, true, ini("1Player"),
                     [i](double v, std::string &e) {
                         for (int j = 0; j < s.draft.hp.quests; j++)
                             if (j != i && s.draft.hp.quest[j].quest == (uint32_t)v) {
@@ -862,7 +1136,7 @@ std::vector<Row> main_rows() {
                     });
                 for (int n = 0; n < 4; n++)
                     number(r, id + "." + std::to_string(n), std::to_string(n + 1) + " " + tr(n == 0 ? "Hunter" : "Hunters"),
-                           &c.hp.quest[i].scale[n], HP_SCALE_MIN, HP_SCALE_MAX, .05f, true);
+                           &c.hp.quest[i].scale[n], HP_SCALE_MIN, HP_SCALE_MAX, .05f, ini("1Player"));
                 action(r, id + ".remove", tr("Remove quest"), [i]() {
                     for (int j = i; j < s.draft.hp.quests - 1; j++) {
                         s.draft.hp.quest[j] = s.draft.hp.quest[j + 1];
@@ -896,23 +1170,37 @@ std::vector<Row> main_rows() {
                 },
                 c.hp.quests < HP_QUESTS_MAX);
         }
+        for (auto &row : r)
+            if (!row.id.compare(0, 6, "quest.") || row.id == "hp.add")
+                row.help = per_quest;
         break;
+    }
     case MODS_PAGE:
         mods_rows(r);
         break;
     case CHEATS_PAGE:
-        cheats_rows(r);
+        cheat_rows(r);
         break;
     case APP_PAGE:
         add_choice(r, "language", "Language", c.language, {"English", "Français", "Español", "Deutsch", "Italiano", "Traditional_Chinese", "Simplified_Chinese"},
                    [](int v) { c.language = v; }, cold("Language"));
-        number(r, "scale", "Interface scale (%)", &c.menu_scale, (int)lo("MenuScale"), (int)hi("MenuScale"), 10, cold("MenuScale"));
-        add_bool(r, "confirm.exit", "Confirm exit", &c.confirm_exit, cold("ConfirmExit"));
+        add_choice(r, "theme", "Menu theme", c.menu_theme, {tr("Gold"), tr("Blue"), tr("Hunter")},
+                   [](int v) { c.menu_theme = v; }, ini("Theme"));
+        number(r, "scale", "Interface scale (%)", &c.menu_scale, (int)lo("MenuScale"), (int)hi("MenuScale"), 10, ini("MenuScale"));
+        add_bool(r, "confirm.exit", "Confirm exit", &c.confirm_exit, ini("ConfirmExit"));
         add_choice(r, "updates", "Updates", c.updates, {tr("Ask"), tr("Auto"), tr("Off")},
-                   [](int v) { c.updates = v; }, cold("Updates"));
-        add_bool(r, "bonus", "Bonus content", &c.bonus_content, cold("BonusContent"));
+                   [](int v) { c.updates = v; }, ini("Updates"));
+        add_bool(r, "bonus", "Bonus content", &c.bonus_content, ini("BonusContent"));
         action(r, "detach", tr(s.floating ? "Attach menu" : "Detach menu"),
-               []() { s.floating = !s.floating; });
+               []() {
+                   s.floating = !s.floating;
+                   if (!s.floating)
+                       s.custom_size = ImVec2(0, 0);
+               });
+        r.back().help =
+            tr(s.floating
+                   ? "Puts the menu back at the top of the screen, at its usual size."
+                   : "Lets the menu go anywhere on the screen: use Move menu, or drag its tabs with the mouse. Its bottom right corner sizes it.");
         if (s.floating)
             action(r, "move", tr("Move menu"), []() {
                 auto *w = ImGui::GetCurrentWindow();
@@ -950,6 +1238,16 @@ bool save() {
         }
         mods.saved = mods.draft;
     }
+    if (cheats_dirty()) {
+        std::unique_ptr<bool[]> on(new bool[cheat_tab.draft.size() + 1]);
+        for (size_t i = 0; i < cheat_tab.draft.size(); ++i)
+            on[i] = cheat_tab.draft[i] != 0;
+        if (!cheats_set(on.get(), (int)cheat_tab.draft.size(), error, sizeof error)) {
+            s.error = settings_text(s.draft.language, error);
+            return false;
+        }
+        cheat_tab.saved = cheat_tab.draft;
+    }
     s.saved = s.draft;
     s.saved_notice = true;
     s.error.clear();
@@ -959,14 +1257,7 @@ std::vector<Row> rows_for_view(bool *open) {
     if (s.view == View::Main)
         return main_rows();
     std::vector<Row> r;
-    if (s.view == View::Choices) {
-        for (int i = 0; i < (int)s.choice.names.size(); i++)
-            action(r, "choice." + std::to_string(i), s.choice.names[i], [i]() {
-                s.choice.set(i);
-                pop();
-            });
-        action(r, "choice.cancel", tr("Cancel"), []() { pop(); });
-    } else if (s.view == View::Keyboard) {
+    if (s.view == View::Keyboard) {
         std::string chars = "1234567890abcdefghijklmnopqrstuvwxyz.:,-_/@";
         if (s.keyboard.upper)
             for (char &c : chars)
@@ -987,6 +1278,42 @@ std::vector<Row> rows_for_view(bool *open) {
     } else if (s.view == View::Conflicts) {
         conflict_rows(r);
         action(r, "conflicts.back", tr("Back"), []() { pop(); });
+    } else if (s.view == View::Keybinds) {
+        keybind_rows(r);
+    } else if (s.view == View::KeyCapture) {
+        int key = captured_key.exchange(-1);
+        const char *name = key > 0 && key < KEY_MOUSE ? SDL_GetScancodeName((SDL_Scancode)key) : "";
+        const char *reserved = key > 0 && key < KEY_MOUSE ? key_reserved(key) : nullptr;
+        if (key == SDL_SCANCODE_ESCAPE)
+            pop();
+        else if (s.capture_bind >= 0 && key > 0) {
+            int *keys = s.draft.binds[s.capture_bind];
+            if (reserved)
+                s.error = fmt("That key is the recomp's own (%s).", tr(reserved));
+            else if (!*config_key_name(key))
+                s.error = tr("That key can't be used.");
+            else {
+                if (!s.capture_add)
+                    keys[0] = key, keys[1] = 0;
+                else if (keys[0] != key)
+                    keys[1] = key;
+                pop();
+            }
+        } else if (key > 0 && *name && strlen(name) < sizeof s.draft.chat_key && !strpbrk(name, ";#")) {
+            SDL_strlcpy(s.draft.chat_key, name, sizeof s.draft.chat_key);
+            pop();
+        } else if (key > 0)
+            s.error = tr("That key can't be used for chat.");
+        if (s.view == View::KeyCapture) {
+            action(r, "capture.none", tr("None"), []() {
+                if (s.capture_bind >= 0)
+                    s.draft.binds[s.capture_bind][0] = s.draft.binds[s.capture_bind][1] = 0;
+                else
+                    s.draft.chat_key[0] = 0;
+                pop();
+            });
+            action(r, "capture.cancel", tr("Cancel"), []() { pop(); });
+        }
     } else if (s.view == View::Move) {
         action(r, "move.accept", tr("Accept"), []() { pop(); });
         action(r, "move.cancel", tr("Cancel"), []() {
@@ -1024,11 +1351,46 @@ std::vector<Row> rows_for_view(bool *open) {
     }
     return r;
 }
+// The open dropdown's choices
+std::vector<Row> dropdown_rows() {
+    std::vector<Row> r;
+    for (int i = 0; i < (int)s.dropdown.names.size(); i++) {
+        action(r, "choice." + std::to_string(i), s.dropdown.names[i], [i]() {
+            auto set = s.dropdown.set;
+            close_dropdown();
+            set(i);
+        });
+        r.back().current = i == s.dropdown.selected;
+    }
+    return r;
+}
+// A row's help: its own, or what the default ini says of its setting (each line looked up in settings_locale.h)
+std::string help_text(const Row &r) {
+    if (!r.help.empty() || r.key.empty())
+        return r.help;
+    static std::vector<std::pair<std::string, std::string>> cache;  // (key, help in English)
+    auto at = std::find_if(cache.begin(), cache.end(), [&](const auto &e) { return e.first == r.key; });
+    if (at == cache.end()) {
+        char buf[2048];
+        cache.emplace_back(r.key, config_help(r.key.c_str(), buf, sizeof buf) ? buf : "");
+        at = cache.end() - 1;
+    }
+    std::string out, line;
+    for (size_t i = 0, j; i < at->second.size(); i = j + 1) {
+        j = at->second.find('\n', i);
+        if (j == std::string::npos)
+            j = at->second.size();
+        line = at->second.substr(i, j - i);
+        out += (out.empty() ? "" : "\n") + std::string(tr(line.c_str()));
+    }
+    return out;
+}
 bool pressed(ImGuiKey key, bool repeat = false) { return ImGui::IsKeyPressed(key, repeat); }
 bool direction(ImGuiKey a, ImGuiKey b, ImGuiKey c) {
     return pressed(a, true) || pressed(b, true) || pressed(c, true);
 }
-void navigate(std::vector<Row> &rows) {
+// list: a dropdown's choices (left / right do nothing there)
+void navigate(std::vector<Row> &rows, bool list = false) {
     if (rows.empty())
         return;
     auto it =
@@ -1048,6 +1410,8 @@ void navigate(std::vector<Row> &rows) {
                                                                                                     : 0;
     if (pressed(ImGuiKey_Tab, true))
         dy = ImGui::GetIO().KeyShift ? -1 : 1;
+    if (list)
+        dx = 0;
     if (dx && it->adjust) {
         it->adjust(dx);
         return;
@@ -1084,10 +1448,12 @@ void navigate(std::vector<Row> &rows) {
         if (next >= 0 && next < (int)rows.size())
             focus(rows[next].id);
     }
+    auto first = std::find_if(rows.begin(), rows.end(), [](const Row &r) { return r.enabled; });
+    auto last = std::find_if(rows.rbegin(), rows.rend(), [](const Row &r) { return r.enabled; });
     if (pressed(ImGuiKey_Home))
-        focus(rows.front().id);
+        focus(first->id);
     if (pressed(ImGuiKey_End))
-        focus(rows.back().id);
+        focus(last->id);
 }
 // Keep ImGui internals at this boundary: rows retain native activation and rendering.
 void own_focus(ImGuiWindow *w, ImGuiID id, const ImRect &rect) {
@@ -1116,16 +1482,32 @@ void own_focus(ImGuiWindow *w, ImGuiID id, const ImRect &rect) {
             ImGui::ScrollToRect(w, rect, ImGuiScrollFlags_KeepVisibleEdgeY);
     }
 }
-void draw_rows(std::vector<Row> &rows) {
+// list: a dropdown's choices; else the view's rows (while a dropdown is open they keep its row marked, the focus being
+// in the dropdown)
+void draw_rows(std::vector<Row> &rows, bool list = false) {
     auto *w = ImGui::GetCurrentWindow();
     float font = ImGui::GetFontSize(), width = ImGui::GetContentRegionAvail().x;
-    bool keyboard_view = s.view == View::Keyboard;
+    bool keyboard_view = s.view == View::Keyboard && !list;
+    bool passive = s.dropdown.open && !list;
     float gap = ImGui::GetStyle().ItemSpacing.x;
     float cell = (width - 9 * gap) / 10;
-    s.targets.clear();
+    if (!list) {
+        s.targets.clear();
+        s.hovered.clear();
+        s.pointing = false;
+        s.dropdown.anchored = false;
+    }
     std::function<void()> activate;
     for (int i = 0; i < (int)rows.size(); i++) {
         Row &r = rows[i];
+        if (r.header) {  // (a section's title: accent-coloured, a little apart from the rows above it)
+            ImVec2 p = ImGui::GetCursorScreenPos();
+            float h = font * (i ? 2.2f : 1.6f);
+            ImGui::Dummy(ImVec2(width, h));
+            w->DrawList->AddText(ImGui::GetFont(), font, ImVec2(p.x + font * .25f, p.y + h - font * 1.35f),
+                                 theme().accent, r.title.c_str());
+            continue;
+        }
         bool grid = keyboard_view && r.id.size() > 4 && r.id[4] >= '0' && r.id[4] <= '9';
         float rw = grid ? cell : width;
         if (grid && i % 10)
@@ -1137,27 +1519,54 @@ void draw_rows(std::vector<Row> &rows) {
         ImGui::PushID(r.id.c_str());
         ImGuiID id = w->GetID("row");
         ImRect rect(p, ImVec2(p.x + rw, p.y + h));
-        bool selected = s.focus == r.id;
-        ImGui::PushStyleColor(ImGuiCol_Button,
-                              selected ? ImVec4(.16f, .32f, .46f, 1) : ImVec4(.09f, .13f, .19f, 1));
-        ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(.15f, .28f, .39f, 1));
-        ImGui::PushStyleColor(ImGuiCol_ButtonActive, ImVec4(.18f, .36f, .49f, 1));
+        bool selected = passive ? r.id == s.dropdown.row : s.focus == r.id;
+        if (passive && selected)
+            s.dropdown.anchor = rect, s.dropdown.anchored = true;
+        const Theme &t = theme();
+        ImGui::PushStyleColor(ImGuiCol_Button, vec(selected && r.enabled ? t.row_focus : t.row));
+        ImGui::PushStyleColor(ImGuiCol_ButtonHovered, vec(selected && r.enabled ? t.row_focus : t.row_hover));
+        ImGui::PushStyleColor(ImGuiCol_ButtonActive, vec(t.row_focus));
         ImGui::PushStyleColor(ImGuiCol_NavCursor, ImVec4(0, 0, 0, 0));
+        ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, t.rounding);
         ImGui::BeginDisabled(!r.enabled);
         bool clicked = ImGui::Button("###row", ImVec2(rw, h));
         ImGui::EndDisabled();
+        ImGui::PopStyleVar();
         ImGui::PopStyleColor(4);
+        if (!list && ImGui::IsItemHovered())
+            s.hovered = r.id;
+        if (!list && ImGui::IsItemHovered(ImGuiHoveredFlags_NoNavOverride))
+            s.pointing = true;
         if (selected && r.enabled) {
-            own_focus(w, id, rect);
-            w->DrawList->AddRect(rect.Min, rect.Max, IM_COL32(111, 216, 255, 255), 3.f, 2.f, 0);
+            if (!passive)
+                own_focus(w, id, rect);
+            if (t.bar)
+                w->DrawList->AddRectFilled(rect.Min, ImVec2(rect.Min.x + font * .22f, rect.Max.y), t.accent,
+                                           t.rounding, ImDrawFlags_RoundCornersLeft);
+            else if (!t.game)
+                w->DrawList->AddRect(rect.Min, rect.Max, t.accent, t.rounding, 0, 2.f);
         }
+        if (t.game && !grid)  // (Hunter: a line under each row)
+            w->DrawList->AddLine(ImVec2(rect.Min.x, rect.Max.y + ImGui::GetStyle().ItemSpacing.y * .5f),
+                                 ImVec2(rect.Max.x, rect.Max.y + ImGui::GetStyle().ItemSpacing.y * .5f), t.divider,
+                                 2.f);
         w->DrawList->PushClipRect(rect.Min, rect.Max, true);
-        ImU32 ink = r.enabled ? IM_COL32(244, 247, 252, 255) : IM_COL32(132, 145, 160, 255);
+        ImU32 ink = !r.enabled ? t.text_off : selected && t.bar ? t.accent_bright : t.text;
+        ImU32 value_ink = r.warn ? IM_COL32(255, 110, 96, 255) : ink;
+        if (r.current)  // (the dropdown's choice now: a bar on its left)
+            w->DrawList->AddRectFilled(rect.Min, ImVec2(rect.Min.x + font * .22f, rect.Max.y), t.accent,
+                                       t.rounding, ImDrawFlags_RoundCornersLeft);
         w->DrawList->AddText(ImGui::GetFont(), font, ImVec2(p.x + font * .5f, p.y + (h - label.y) * .5f), ink,
                              r.title.c_str(), nullptr, wrap);
+        float arrow = 0;
+        if (r.menu && r.enabled) {  // (Confirm opens a dropdown: an arrow after the value)
+            arrow = font * 1.1f;
+            ImGui::RenderArrow(w->DrawList, ImVec2(p.x + rw - font * .5f - font * .7f, p.y + (h - font) * .5f), ink,
+                               s.dropdown.open && s.dropdown.row == r.id ? ImGuiDir_Up : ImGuiDir_Down, .7f);
+        }
         if (!r.value.empty()) {
             std::string value = r.value + (r.cold ? " *" : "");
-            float available = rw * .38f - font;
+            float available = rw * .38f - font - arrow;
             if (ImGui::CalcTextSize(value.c_str()).x > available) {
                 do {
                     size_t n = value.size() - 1;
@@ -1168,7 +1577,7 @@ void draw_rows(std::vector<Row> &rows) {
                 value += "...";
             }
             auto sz = ImGui::CalcTextSize(value.c_str());
-            w->DrawList->AddText(ImVec2(p.x + rw - font * .5f - sz.x, p.y + (h - font) * .5f), ink,
+            w->DrawList->AddText(ImVec2(p.x + rw - font * .5f - arrow - sz.x, p.y + (h - font) * .5f), value_ink,
                                  value.c_str());
         }
         w->DrawList->PopClipRect();
@@ -1182,11 +1591,142 @@ void draw_rows(std::vector<Row> &rows) {
     if (activate)
         activate();
 }
+// The open dropdown, a window of its own over the menu: under its row, at the right, or above the row when there is
+// more room there; it scrolls when it doesn't fit. scale, base: the menu's (settings_panel)
+void draw_dropdown(std::vector<Row> &options, float scale, float base) {
+    ImGuiViewport *vp = ImGui::GetMainViewport();
+    const ImGuiStyle &style = ImGui::GetStyle();
+    float font = base * scale, longest = 0;
+    for (const auto &o : options)
+        longest = std::max(longest, ImGui::CalcTextSize(o.title.c_str()).x * scale);
+    const ImRect &a = s.dropdown.anchor;
+    float w = std::clamp(longest + font * 2 + style.WindowPadding.x * 2, a.GetWidth() * .4f, a.GetWidth());
+    float h = options.size() * (font * 2.1f + style.ItemSpacing.y) - style.ItemSpacing.y + style.WindowPadding.y * 2;
+    float below = vp->WorkPos.y + vp->WorkSize.y - a.Max.y, above = a.Min.y - vp->WorkPos.y;
+    bool up = h > below && above > below;
+    h = std::min(h, up ? above : below);
+    ImGui::SetNextWindowPos(ImVec2(a.Max.x - w, up ? a.Min.y - h : a.Max.y), ImGuiCond_Always);
+    ImGui::SetNextWindowSize(ImVec2(w, h), ImGuiCond_Always);
+    ImGui::PushStyleColor(ImGuiCol_WindowBg, vec(theme().popup));
+    ImGui::PushStyleColor(ImGuiCol_Border, vec(theme().edge));
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowBorderSize, 1.f);
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, theme().rounding);
+    ImGui::Begin("Settings##dropdown", nullptr,
+                 ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove |
+                     ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoSavedSettings);
+    ImGui::SetWindowFontScale(scale);
+    draw_rows(options, true);
+    s.dropdown.hovered = ImGui::IsWindowHovered();
+    ImGui::End();
+    ImGui::PopStyleVar(2);
+    ImGui::PopStyleColor(2);
+}
+// Hunter's window frame, over the rest: a red rule with a green one inside it along the top and the bottom, and a gold
+// square on each corner
+void draw_frame(ImGuiWindow *w, const Theme &look) {
+    if (!look.game)
+        return;
+    const ImU32 red = IM_COL32(176, 34, 30, 255), green = IM_COL32(80, 142, 54, 255), gold = IM_COL32(222, 190, 40, 255);
+    float b = w->WindowBorderSize, x0 = w->Pos.x + b, x1 = w->Pos.x + w->Size.x - b, y0 = w->Pos.y + b,
+          y1 = w->Pos.y + w->Size.y - b, line = std::max(2.f, ImGui::GetFontSize() * .14f);
+    w->DrawList->PushClipRectFullScreen();
+    w->DrawList->AddRectFilled(ImVec2(x0, y0), ImVec2(x1, y0 + line), red);
+    w->DrawList->AddRectFilled(ImVec2(x0, y0 + line), ImVec2(x1, y0 + line * 1.7f), green);
+    w->DrawList->AddRectFilled(ImVec2(x0, y1 - line * 1.7f), ImVec2(x1, y1 - line), green);
+    w->DrawList->AddRectFilled(ImVec2(x0, y1 - line), ImVec2(x1, y1), red);
+    float c = ImGui::GetFontSize() * .5f;
+    for (ImVec2 corner : {w->Pos, ImVec2(w->Pos.x + w->Size.x, w->Pos.y), ImVec2(w->Pos.x, w->Pos.y + w->Size.y),
+                          ImVec2(w->Pos.x + w->Size.x, w->Pos.y + w->Size.y)}) {
+        ImVec2 a(corner.x - c * .5f, corner.y - c * .5f), z(corner.x + c * .5f, corner.y + c * .5f);
+        w->DrawList->AddRectFilled(a, z, IM_COL32(0, 0, 0, 255));
+        w->DrawList->AddRect(ImVec2(a.x + 1, a.y + 1), ImVec2(z.x - 1, z.y - 1), gold, 0, 0, std::max(1.f, c * .16f));
+        w->DrawList->AddRectFilled(ImVec2(corner.x - c * .14f, corner.y - c * .14f),
+                                   ImVec2(corner.x + c * .14f, corner.y + c * .14f), gold);
+    }
+    w->DrawList->PopClipRect();
+}
+// The corner grip that sizes the menu (mouse_drag): three short lines across the bottom right corner
+float grip_size() { return ImGui::GetFontSize() * 1.3f; }
+void draw_grip(ImGuiWindow *w, const Theme &look) {
+    ImVec2 corner(w->Pos.x + w->Size.x, w->Pos.y + w->Size.y);
+    float g = grip_size(), inset = look.bar ? g * .35f : g * .2f;
+    bool lit =
+        s.dragging == 2 || ImRect(ImVec2(corner.x - g, corner.y - g), corner).Contains(ImGui::GetIO().MousePos);
+    w->DrawList->PushClipRectFullScreen();
+    for (int i = 1; i <= 3; i++) {
+        float d = g * .22f * i;
+        w->DrawList->AddLine(ImVec2(corner.x - inset - d, corner.y - inset),
+                             ImVec2(corner.x - inset, corner.y - inset - d), lit ? look.accent : look.text_off, 1.5f);
+    }
+    w->DrawList->PopClipRect();
+}
+// The mouse on the menu, before it is drawn: a press on its top part (the tabs, or a dialog's title) and a drag moves
+// it, one on the grip at its bottom right corner sizes it. Either one detaches it (Menu Options: Attach menu puts it back).
+void mouse_drag(ImGuiViewport *vp, float width) {
+    ImGuiIO &io = ImGui::GetIO();
+    auto *w = ImGui::FindWindowByName("Settings##main");
+    if (!w || s.view == View::Move)
+        return;
+    if (ImGui::IsMouseClicked(ImGuiMouseButton_Left) && !s.dropdown.open) {
+        float g = grip_size();
+        ImVec2 corner(w->Pos.x + w->Size.x, w->Pos.y + w->Size.y);
+        s.dragged = false;
+        bool grip = ImRect(ImVec2(corner.x - g, corner.y - g), corner).Contains(io.MousePos);
+        bool top = ImRect(w->Pos, ImVec2(corner.x, w->Pos.y + s.header_bottom)).Contains(io.MousePos);
+        s.dragging = grip ? 2 : top ? 1 : 0;
+        s.drag_mouse = io.MousePos;
+        s.drag_from = s.dragging == 2 ? w->Size : w->Pos;
+    }
+    if (!s.dragging)
+        return;
+    if (!ImGui::IsMouseDown(ImGuiMouseButton_Left)) {
+        s.dragging = 0;
+        return;
+    }
+    ImVec2 d(io.MousePos.x - s.drag_mouse.x, io.MousePos.y - s.drag_mouse.y);
+    if (!s.dragged && d.x * d.x + d.y * d.y < io.MouseDragThreshold * io.MouseDragThreshold)
+        return;
+    s.dragged = true;
+    if (!s.floating) {
+        s.floating = true;
+        s.move_position = w->Pos;
+    }
+    if (s.dragging == 2) {
+        s.custom_size = ImVec2(s.drag_from.x + d.x, s.drag_from.y + d.y);
+        s.move_position = w->Pos;
+    } else {
+        float h = w->Size.y;
+        s.move_position.x = std::clamp(s.drag_from.x + d.x, vp->WorkPos.x - width * .5f,
+                                       vp->WorkPos.x + vp->WorkSize.x - width * .5f);
+        s.move_position.y = std::clamp(s.drag_from.y + d.y, vp->WorkPos.y,
+                                       vp->WorkPos.y + std::max(0.f, vp->WorkSize.y - h * .25f));
+    }
+    s.position_override = true;
+}
 } // namespace
 void settings_panel_request_close() { request_exit.store(true); }
 void settings_panel_request_back() { request_back.store(true); }
 bool settings_panel_dirty() { return is_dirty.load(); }
+int settings_panel_theme() { return s.editing ? s.draft.menu_theme : config_editable().menu_theme; }
 bool settings_panel_confirming() { return is_confirming.load() || request_exit.load(); }
+bool settings_panel_key(int scancode) {
+    if (!is_capturing.load())
+        return false;
+    captured_key = scancode;
+    return true;
+}
+bool settings_panel_mouse(int button) {
+    if (!capture_mouse.load() || button < 1 || button > SDL_BUTTON_X2)
+        return false;
+    captured_key = KEY_MOUSE + button;
+    return true;
+}
+bool settings_panel_wheel(int notches) {
+    if (!capture_wheel.load() || !notches)
+        return false;
+    captured_key = notches > 0 ? KEY_WHEEL_UP : KEY_WHEEL_DOWN;
+    return true;
+}
 // Ownership has to precede NewFrame: native cancel/windowing runs there.
 void settings_panel_before_frame(bool open) {
     if (!open && !request_exit.load())
@@ -1224,6 +1764,8 @@ void settings_panel(bool *open) {
         s.editing = false;
         is_dirty = false;
         is_confirming = false;
+        is_capturing = false;
+        capture_mouse = false;
         return;
     }
     if (!s.editing) {
@@ -1237,8 +1779,11 @@ void settings_panel(bool *open) {
         s.saved_notice = false;
         s.floating = false;
         s.advanced = false;
+        s.dropdown.open = false;
+        s.help_row.clear();
         quest_keys();
         load_mods();
+        load_cheats();
     }
     if (request_exit.exchange(false) && s.view != View::Exit)
         push(View::Exit, "dialog.cancel");
@@ -1248,7 +1793,17 @@ void settings_panel(bool *open) {
     float base = ImGui::GetFontSize();
     float margin = std::min(16.f, vp->WorkSize.x * .025f);
     float width = std::min(vp->WorkSize.x - 2 * margin, base * scale * 56);
-    ImGui::SetNextWindowSizeConstraints(ImVec2(width, 0), ImVec2(width, vp->WorkSize.y - 2 * margin));
+    bool sized = s.custom_size.x > 0;
+    if (sized) {
+        ImVec2 least(std::min(base * scale * 26, vp->WorkSize.x), std::min(base * scale * 14, vp->WorkSize.y));
+        s.custom_size.x = std::clamp(s.custom_size.x, least.x, vp->WorkSize.x);
+        s.custom_size.y = std::clamp(s.custom_size.y, least.y, vp->WorkSize.y);
+        width = s.custom_size.x;
+        ImGui::SetNextWindowSize(s.custom_size, ImGuiCond_Always);
+    } else {
+        ImGui::SetNextWindowSizeConstraints(ImVec2(width, 0), ImVec2(width, vp->WorkSize.y - 2 * margin));
+    }
+    mouse_drag(vp, width);
     if (s.view == View::Move) {
         float x =
             (direction(ImGuiKey_RightArrow, ImGuiKey_GamepadDpadRight, ImGuiKey_GamepadLStickRight) ? 1 : 0) -
@@ -1271,12 +1826,18 @@ void settings_panel(bool *open) {
     if (!s.floating)
         ImGui::SetNextWindowPos(
             ImVec2(vp->WorkPos.x + (vp->WorkSize.x - width) * .5f, vp->WorkPos.y + margin), ImGuiCond_Always);
-    ImGui::PushStyleColor(ImGuiCol_WindowBg, ImVec4(.025f, .04f, .065f, .98f));
-    ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(.96f, .97f, 1, 1));
+    const Theme &look = theme();
+    ImGui::PushStyleColor(ImGuiCol_WindowBg, vec(look.panel));
+    ImGui::PushStyleColor(ImGuiCol_Text, vec(look.text));
+    ImGui::PushStyleColor(ImGuiCol_Border, vec(look.edge));
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding,
+                        look.bar ? 12.f : look.game ? 0.f : ImGui::GetStyle().WindowRounding);
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowBorderSize,
+                        look.bar ? 1.5f : look.game ? 2.f : ImGui::GetStyle().WindowBorderSize);
     ImGui::Begin("Settings##main", nullptr,
-                 ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoCollapse |
-                     ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoTitleBar |
-                     (s.floating ? 0 : ImGuiWindowFlags_NoMove));
+                 (sized ? 0 : ImGuiWindowFlags_AlwaysAutoResize) | ImGuiWindowFlags_NoCollapse |
+                     ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoMove |
+                     ImGuiWindowFlags_NoResize);
     ImGui::SetWindowFontScale(scale);
     if (s.restore_scroll) {
         ImGui::SetScrollY(s.scroll);
@@ -1284,26 +1845,34 @@ void settings_panel(bool *open) {
     }
     if (request_back.exchange(false) || pressed(ImGuiKey_GamepadFaceRight) || pressed(ImGuiKey_Escape))
         ask_back(open);
+    if (s.dropdown.open && ImGui::IsMouseClicked(ImGuiMouseButton_Left) && !s.dropdown.hovered)
+        close_dropdown();  // (a click elsewhere: on a row, it acts as it does with no dropdown open)
     bool pinned_guides = s.view == View::Main;
     bool clipped_body = false;
     auto *window = ImGui::GetCurrentWindow();
+    float spacing = ImGui::GetStyle().ItemSpacing.y;
     GuideLayout guides = guide_layout(ImGui::GetContentRegionAvail().x);
-    s.guide_height = pinned_guides ? guides.height : 0;
+    // pinned above the guides: the help of the row focused or pointed at, with room for the longest of the tab
+    float help_area = pinned_guides && s.help_height > 0 ? s.help_height + spacing * 2 : 0;
+    s.guide_height = pinned_guides ? guides.height + help_area : 0;
     float guide_top =
         std::max(window->Pos.y + window->Size.y - ImGui::GetStyle().WindowPadding.y - guides.height,
                  window->InnerClipRect.Min.y);
+    float help_top = std::max(guide_top - help_area, window->InnerClipRect.Min.y);
     if (pinned_guides)
         ImGui::PushClipRect(
             window->InnerClipRect.Min,
-            ImVec2(window->InnerClipRect.Max.x,
-                   std::max(window->InnerClipRect.Min.y, guide_top - ImGui::GetStyle().ItemSpacing.y)),
-            true);
+            ImVec2(window->InnerClipRect.Max.x, std::max(window->InnerClipRect.Min.y, help_top - spacing)), true);
     if (s.view == View::Main) {
+        // Save from anywhere on the tab: the top face button, or Ctrl+S
+        if ((pressed(ImGuiKey_GamepadFaceUp) || (ImGui::GetIO().KeyCtrl && pressed(ImGuiKey_S))) && dirty() &&
+            !s.dropdown.open)
+            s.command = Command::Save;
         if (pressed(ImGuiKey_GamepadR1))
             first_page((s.page + 1) % PAGES);
         if (pressed(ImGuiKey_GamepadL1))
             first_page((s.page + PAGES - 1) % PAGES);
-        const char *pages[] = {"Display", "Graphics & Audio", "Controls", "Network", "Miscellaneous", "Mods", "Cheats", "App"};
+        const char *pages[] = {"Display", "Graphics & Audio", "Controls", "Network", "Misc", "Mods", "Cheats", "Menu Options"};
         float avail = ImGui::GetContentRegionAvail().x;
         float fw = ImGui::GetFontSize();
         ImVec2 scrolling_start = ImGui::GetCursorScreenPos();
@@ -1317,10 +1886,17 @@ void settings_panel(bool *open) {
         int lines = (PAGES + columns - 1) / columns;
         float header_height = tabh * lines + ImGui::GetStyle().ItemSpacing.y * (lines - 1);
         auto *header = ImGui::GetWindowDrawList();
-        header->AddRectFilled(
-            ImVec2(window->InnerRect.Min.x, window->InnerRect.Min.y),
-            ImVec2(window->InnerRect.Max.x, tabs_start.y + header_height + ImGui::GetStyle().ItemSpacing.y),
-            ImGui::GetColorU32(ImGuiCol_WindowBg) | IM_COL32_A_MASK);
+        {  // (over the rows scrolled under the tabs; inside the border, with the window's rounded top corners - the
+           // right one left to the window where the scrollbar is)
+            float border = window->WindowBorderSize;
+            bool scrollbar = window->ScrollbarY;
+            header->AddRectFilled(
+                ImVec2(window->Pos.x + border, window->Pos.y + border),
+                ImVec2(scrollbar ? window->InnerRect.Max.x : window->Pos.x + window->Size.x - border,
+                       tabs_start.y + header_height + ImGui::GetStyle().ItemSpacing.y),
+                look.game ? look.header : ImGui::GetColorU32(ImGuiCol_WindowBg) | IM_COL32_A_MASK, std::max(0.f, window->WindowRounding - border),
+                scrollbar ? ImDrawFlags_RoundCornersTopLeft : ImDrawFlags_RoundCornersTop);
+        }
         SettingsIcons::draw(header, ImVec2(tabs_start.x, tabs_start.y + (header_height - fw) * .5f), fw,
                             s.draft.button_icons, SettingsIcons::Left, 0);
         SettingsIcons::draw(
@@ -1334,45 +1910,65 @@ void settings_panel(bool *open) {
             ImGui::PushID(i);
             ImVec2 p = ImGui::GetCursorScreenPos();
             bool active = s.page == i;
-            ImGui::PushStyleColor(ImGuiCol_Button,
-                                  active ? ImVec4(.18f, .4f, .56f, 1) : ImVec4(.06f, .09f, .14f, 1));
+            ImGui::PushStyleColor(ImGuiCol_Button, vec(active ? look.tab_active : look.tab));
+            ImGui::PushStyleColor(ImGuiCol_ButtonHovered, vec(look.row_hover));
+            ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, look.rounding);
             ImGui::PushItemFlag(ImGuiItemFlags_NoNav, true);
-            if (ImGui::Button("###tab", ImVec2(tabw, tabh)))
+            if (ImGui::Button("###tab", ImVec2(tabw, tabh)) && !s.dragged)
                 first_page(i);
             ImGui::PopItemFlag();
-            // A label wraps at its spaces; one word wider than the tab ("Miscellaneous") is drawn smaller instead of
+            ImGui::PopStyleVar();
+            // A label wraps at its spaces; one word wider than the tab is drawn smaller instead of
             // being cut in two
             const char *name = tr(pages[i]);
             float room = tabw - fw * .5f, size = fw;
             float word = ImGui::CalcTextSize(name).x;
             if (!strchr(name, ' ') && word > room) size = fw * room / word;
             auto label = ImGui::GetFont()->CalcTextSizeA(size, FLT_MAX, room, name);
+            // (Gold: the names centred, the other tabs dimmed, the active one underlined in its middle)
+            bool named = look.bar || look.game;
+            float indent = named ? (tabw - label.x) * .5f : fw * .25f;
             ImGui::GetWindowDrawList()->AddText(ImGui::GetFont(), size,
-                                                ImVec2(p.x + fw * .25f, p.y + (tabh - label.y) * .5f),
-                                                IM_COL32(244, 247, 252, 255), name, nullptr, room);
+                                                ImVec2(p.x + indent, p.y + (tabh - label.y) * .5f),
+                                                named ? (active ? look.accent_bright : look.text_dim) : look.text,
+                                                name, nullptr, room);
+            float inset = named ? tabw * .18f : 0;
             if (active)
-                ImGui::GetWindowDrawList()->AddRectFilled(ImVec2(p.x, p.y + tabh - 3),
-                                                          ImVec2(p.x + tabw, p.y + tabh),
-                                                          IM_COL32(111, 216, 255, 255));
-            ImGui::PopStyleColor();
+                ImGui::GetWindowDrawList()->AddRectFilled(ImVec2(p.x + inset, p.y + tabh - 3),
+                                                          ImVec2(p.x + tabw - inset, p.y + tabh), look.accent,
+                                                          named && !look.game ? 2.f : 0.f);
+            ImGui::PopStyleColor(2);
             ImGui::PopID();
+        }
+        if (look.bar) {  // (Gold: a rule under the tabs, gold at the sides and fading out in the middle)
+            float y = tabs_start.y + header_height + ImGui::GetStyle().ItemSpacing.y * .5f;
+            float mid = (window->InnerRect.Min.x + window->InnerRect.Max.x) * .5f;
+            ImU32 clear = look.accent & ~IM_COL32_A_MASK;
+            header->AddRectFilledMultiColor(ImVec2(tabs_start.x, y), ImVec2(mid, y + 2), look.accent, clear, clear,
+                                            look.accent);
+            header->AddRectFilledMultiColor(ImVec2(mid, y), ImVec2(tabs_start.x + avail, y + 2), clear, look.accent,
+                                            look.accent, clear);
         }
         ImGui::SetCursorScreenPos(
             ImVec2(scrolling_start.x, scrolling_start.y + header_height + ImGui::GetStyle().ItemSpacing.y));
         float body_top = tabs_start.y + header_height + ImGui::GetStyle().ItemSpacing.y;
+        s.header_bottom = body_top - window->Pos.y;
         ImGui::PushClipRect(ImVec2(window->ClipRect.Min.x, std::min(body_top, window->ClipRect.Max.y)),
                             window->ClipRect.Max, true);
         clipped_body = true;
     } else {
-        const char *title = s.view == View::Choices    ? s.choice.title.c_str()
-                            : s.view == View::Keyboard ? s.keyboard.title.c_str()
-                                                       : tr(s.view == View::Exit      ? "Exit game?"
-                                                            : s.view == View::Restart ? "Restart game?"
-                                                            : s.view == View::Reset   ? "Reset this tab?"
-                                                            : s.view == View::Move    ? "Move menu"
-                                                            : s.view == View::Conflicts ? "Mod conflicts"
-                                                                                      : "Unsaved changes");
-        ImGui::TextWrapped("%s", title);
+        std::string title = s.view == View::Keyboard ? s.keyboard.title
+                            : s.view == View::KeyCapture && s.capture_bind >= 0
+                                ? fmt("Press a key or mouse button for %s (Esc: cancel)", tr(bind_titles[s.capture_bind]))
+                                : tr(s.view == View::Exit         ? "Exit game?"
+                                     : s.view == View::Restart    ? "Restart game?"
+                                     : s.view == View::Reset      ? "Reset this tab?"
+                                     : s.view == View::Move       ? "Move menu"
+                                     : s.view == View::Conflicts  ? "Mod conflicts"
+                                     : s.view == View::Keybinds   ? "Keybinds"
+                                     : s.view == View::KeyCapture ? "Press the key for chat (Esc: cancel)"
+                                                                  : "Unsaved changes");
+        ImGui::TextWrapped("%s", title.c_str());
     }
     if (s.view == View::Keyboard) {
         ImGuiIO &io = ImGui::GetIO();
@@ -1421,11 +2017,35 @@ void settings_panel(bool *open) {
         }
     }
     auto rows = rows_for_view(open);
-    if (s.view != View::Move)
-        navigate(rows);
-    else
+    std::vector<Row> options;  // (a dropdown open: the controller moves in it)
+    if (s.dropdown.open)
+        options = dropdown_rows();
+    if (s.view == View::Move)
         focus("move.accept");
+    else
+        navigate(s.dropdown.open ? options : rows, s.dropdown.open);
     draw_rows(rows);
+    float help_wrap = window->InnerRect.GetWidth() - 2 * ImGui::GetStyle().WindowPadding.x;
+    std::string help;
+    if (s.view == View::Main) {  // (the row moved to, or the one the mouse moved onto)
+        static std::string last_focus;
+        if (s.focus != last_focus)
+            last_focus = s.help_row = s.focus;
+        ImVec2 moved = ImGui::GetIO().MouseDelta;
+        if ((moved.x || moved.y) && !s.hovered.empty())
+            s.help_row = s.hovered;
+        const std::string &id = s.dropdown.open ? s.dropdown.row : s.help_row;
+        float tallest = 0;
+        for (const auto &r : rows) {
+            std::string text = help_text(r);
+            if (!text.empty())
+                tallest = std::max(tallest, ImGui::CalcTextSize(text.c_str(), nullptr, false, help_wrap).y);
+            if (r.id == id)
+                help = text;
+        }
+        s.help_height = tallest;
+    } else
+        s.help_height = 0;
     if (s.command != Command::None) {
         auto cmd = s.command;
         s.command = Command::None;
@@ -1437,7 +2057,7 @@ void settings_panel(bool *open) {
     if (ui_action_failed())
         s.error = tr("Restart failed. The game is still running.");
     if (!s.error.empty()) {
-        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1, .72f, .57f, 1));
+        ImGui::PushStyleColor(ImGuiCol_Text, vec(look.warn));
         ImGui::TextWrapped("%s", s.error.c_str());
         ImGui::PopStyleColor();
     } else if (s.saved_notice)
@@ -1447,22 +2067,49 @@ void settings_panel(bool *open) {
             ImGui::TextWrapped("%s", tr("FSR overrides MSAA and FXAA while active."));
         if (s.page == MODS_PAGE)
             ImGui::TextWrapped("%s", tr("Mods load from top to bottom: a later mod wins. Select a conflict to choose which mod is used. Press Save, then restart."));
-        if (s.page == CHEATS_PAGE)
-            ImGui::TextWrapped("%s", tr("Cheats apply at once and are remembered. A cheat that changes the game's code makes that function run in the interpreter."));
+        if (s.page == CHEATS_PAGE) {
+            ImGui::PushStyleColor(ImGuiCol_Text, vec(theme().warn));
+            ImGui::TextWrapped("%s", tr("Online: only use cheats when everyone in the lobby agrees to it."));
+            ImGui::PopStyleColor();
+            ImGui::TextWrapped("%s", tr("Cheats turn on and off when you press Save, no restart needed. Turning one off undoes its changes to the game's code; values it already changed (money, items) stay. New cheat files show up after a restart."));
+        }
         ImGui::TextUnformatted(tr("* Restart required"));
         // Keep scroll space for the pinned hints so the last action can scroll fully above them.
-        ImGui::Dummy(ImVec2(1, guides.height + ImGui::GetStyle().ItemSpacing.y));
+        ImGui::Dummy(ImVec2(1, guides.height + help_area + ImGui::GetStyle().ItemSpacing.y));
     }
     if (clipped_body)
         ImGui::PopClipRect();
     if (pinned_guides)
         ImGui::PopClipRect();
+    if (pinned_guides && help_area > 0) {
+        auto *draw = window->DrawList;
+        float x0 = window->InnerRect.Min.x, x1 = window->InnerRect.Max.x, pad = ImGui::GetStyle().WindowPadding.x;
+        draw->AddRectFilled(ImVec2(x0, help_top - spacing), ImVec2(x1, guide_top),
+                            ImGui::GetColorU32(ImGuiCol_WindowBg) | IM_COL32_A_MASK);
+        draw->AddLine(ImVec2(x0 + pad, help_top), ImVec2(x1 - pad, help_top), look.divider);
+        if (!help.empty())
+            draw->AddText(ImGui::GetFont(), ImGui::GetFontSize(), ImVec2(x0 + pad, help_top + spacing),
+                          look.text_dim, help.c_str(), nullptr, help_wrap);
+    }
     if (pinned_guides && s.view == View::Main)
         draw_guides(window, guides, guide_top);
+    if (s.view != View::Main)
+        s.header_bottom = ImGui::GetStyle().WindowPadding.y + ImGui::GetFontSize() * 1.5f;
+    draw_frame(window, look);
+    draw_grip(window, look);
     ImGui::End();
-    ImGui::PopStyleColor(2);
+    if (s.dropdown.open && s.dropdown.anchored && !options.empty())
+        draw_dropdown(options, scale, base);
+    else
+        s.dropdown.hovered = false;
+    ImGui::PopStyleVar(2);
+    ImGui::PopStyleColor(3);
     is_dirty = *open && (dirty() || pending_text());
     is_confirming = *open && confirmation();
+    is_capturing = *open && s.view == View::KeyCapture;
+    // (a click on the capture view's buttons is theirs; anywhere else it is the mouse button chosen)
+    capture_mouse = is_capturing && s.capture_bind >= 0 && !s.pointing;
+    capture_wheel = is_capturing && s.capture_bind >= 0;  // (the capture view doesn't scroll)
     if (!*open)
         s.editing = false;
 }

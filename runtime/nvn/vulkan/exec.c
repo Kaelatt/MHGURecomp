@@ -736,14 +736,18 @@ static bool ui_relax_scissor;  // the draw being set up moved a HUD piece out fr
 static int ui_scissor_v = -1;  // 16:10: the draw being set up is a HUD piece anchored so (0 top, 1 centre, 2 bottom),
                                // and its scissor moves with it
 static bool ui_menu_pass;  // this pass drew a layer 97 menu before (the windows of layer 100 then sit beside Top-anchored ones)
-// The HUD quads this pass drew last (16:9 canvas place, vertical anchor 0 top / 1 centre / 2 bottom): a model preview
-// follows the window drawn over it (ui_preview_map)
+// The HUD quads this pass drew last (16:9 canvas place, vertical anchor 0 top / 1 centre / 2 bottom, horizontal 0 left /
+// 1 right / 2 centre): a model preview follows the window drawn over it (ui_preview_map)
 #define UI_RECENT 256
-static struct { float x, y; uint8_t vanchor; } ui_recent[UI_RECENT];
+static struct { float x, y; uint8_t vanchor, hanchor; } ui_recent[UI_RECENT];
 static uint32_t ui_nrecent;  // (quads recorded this pass; the slot is the count modulo UI_RECENT)
 static bool ui_loading_pass;  // this pass draws the loading screen (its backdrop, layer 110, came first)
 static bool ui_title_pass;  // this pass draws the title screen (its layout, layer 108 at the canvas centre, came first)
+static bool ui_frontend_pass;  // this pass draws a front-end screen (Main Menu, Character Select: its 16:9 backdrop, layer
+                               // 250 at the canvas centre, came first)
+static bool ui_stamp_pass;  // this pass draws the Quest Complete stamp (its borders, layer 97 at x 640, y 53 / 687, came first)
 static bool ui_results_pass, ui_results_last;  // this pass / the last pass with HUD in it draws the quest results screen
+static bool ui_meownster_pass;  // this pass draws the Meownster Hunters return screen (its map frame, layer 105, came first)
 volatile int g_hudtrace_active;  // (debug) MHGU_CONTROL "hudtrace": log every HUD quad of the next frame and its anchor (device.c)
 
 // 16:10: a window is drawn as pieces (body, edges, corners, then its text), each placed by its own centre, so one rule
@@ -849,7 +853,7 @@ static inline bool ss_need(uint32_t bit, bool same) {
 }
 
 // ---- (debug) pass dumps: MHGU_CONTROL "dump" saves colour target 0 of every render pass of the next frame as
-// shots/pass_NNN_<format>_<w>x<h>.png (RGBA8 / BGRA8 / RGBA16F / B10G11R11; HDR values clamped to [0, 1] and also
+// shots/pass_NNN_<format>_<w>x<h>.png (RGBA8 / BGRA8 / RGBA16F / RGBA16 / B10G11R11; HDR values clamped to [0, 1] and also
 // listed as the max in the log line).
 volatile int g_dump_active;  // (device.c: set for one frame)
 static char dump_draw_info[4096];  // the pass's last draw: program and fragment textures
@@ -918,7 +922,7 @@ static void dump_pass(void) {
     switch (b->format) {
     case VK_FORMAT_R8G8B8A8_UNORM: case VK_FORMAT_R8G8B8A8_SRGB: case VK_FORMAT_B8G8R8A8_UNORM: case VK_FORMAT_B8G8R8A8_SRGB:
     case VK_FORMAT_B10G11R11_UFLOAT_PACK32: bpp = 4; break;
-    case VK_FORMAT_R16G16B16A16_SFLOAT: bpp = 8; break;
+    case VK_FORMAT_R16G16B16A16_SFLOAT: case VK_FORMAT_R16G16B16A16_UNORM: bpp = 8; break;
     default:
         LOG("[dump] pass %03d: format %d %ux%u (not dumped, %llu draws)\n", g_dump_no++, b->format, w, h, (unsigned long long)draws);
         return;
@@ -939,6 +943,9 @@ static void dump_pass(void) {
         if (b->format == VK_FORMAT_R16G16B16A16_SFLOAT) {
             const uint16_t *q = (const uint16_t *)s;
             for (int k = 0; k < 4; k++) f[k] = half_to_float(q[k]);
+        } else if (b->format == VK_FORMAT_R16G16B16A16_UNORM) {
+            const uint16_t *q = (const uint16_t *)s;
+            for (int k = 0; k < 4; k++) f[k] = q[k] / 65535.0f;
         } else if (b->format == VK_FORMAT_B10G11R11_UFLOAT_PACK32) {
             uint32_t v;
             memcpy(&v, s, 4);
@@ -1013,6 +1020,12 @@ void vk_gpuprof_frame(void) {  // (device.c, after each presented frame's submis
 static bool pass_msaa;  // (MSAA, below) the pass renders through multisampled images (resolved when next read)
 static TexBackend *pass_att[9];
 static uint32_t pass_natt;
+// (MSAA) colour target 0 is a picture 3D models are drawn into (ms_expand). Its picture is copied into the samples
+// only for what tests depth (the models, and the depth clears before them): the menu's 2D draws before the first model
+// stay without MSAA; the ones after it go into the samples too, shaded per sample (else the seams between their quads
+// show), so the frame doesn't switch between the two. draw / clear set ms_want_depth before a pass begins;
+// pass_want_depth: what the pass began for
+static bool pass_models, pass_want_depth, ms_want_depth;
 
 void vk_end_pass(void) {
     if (!in_pass) return;
@@ -1039,7 +1052,8 @@ void vk_end_pass(void) {
 // target (a pass without MSAA, a copy) makes it stale, and a pass with a stale companion that isn't cleared first
 // renders without MSAA. The target itself is brought up to date (resolved: vk_ms_resolve) only when something reads
 // it - a draw or dispatch sampling it, a copy, a pass without MSAA, presentation - so the scene's passes in a row
-// share one resolve: on the R9 270X a resolve is the expensive part of MSAA.
+// share one resolve: on the R9 270X a resolve is the expensive part of MSAA. (Menus: 3D models drawn over the finished
+// picture, ms_expand.)
 static uint64_t cur_rec;  // guest address of the command being executed (exec_list)
 static int rt_kind(uint32_t f);
 
@@ -1077,7 +1091,11 @@ static uint32_t leading_clears(uint32_t w, uint32_t h, bool stencil) {
 static VkDescriptorSetLayout rs_set_layout;
 static VkPipelineLayout rs_layout;
 
-static VkPipeline resolve_pipeline(VkRenderPass rp, int kind) {  // kind 1 depth, 2 depth + stencil
+// kind 1 depth, 2 depth + stencil; into a multisampled target of `samples` (ms_expand): 3 colour, 4 depth, 5 depth +
+// stencil; 6 FXAA over menus' 3D models, colour without alpha (models_fxaa_end)
+static VkPipeline resolve_pipeline(VkRenderPass rp, int kind, uint32_t samples) {
+    static const char *frag[] = {NULL, "resolve.frag.depth", "resolve.frag.depth.s", "expand.frag", "expand.frag.depth",
+                                 "expand.frag.depth.s", "fxaa.frag.models"};
     static struct { VkRenderPass rp; int kind; VkPipeline p; } tab[32];
     static int n;
     for (int i = 0; i < n; i++) if (tab[i].rp == rp && tab[i].kind == kind) return tab[i].p;
@@ -1096,7 +1114,7 @@ static VkPipeline resolve_pipeline(VkRenderPass rp, int kind) {  // kind 1 depth
         {.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, .stage = VK_SHADER_STAGE_VERTEX_BIT,
          .module = vk_builtin_shader("resolve.vert"), .pName = "main"},
         {.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, .stage = VK_SHADER_STAGE_FRAGMENT_BIT,
-         .module = vk_builtin_shader(kind == 2 ? "resolve.frag.depth.s" : "resolve.frag.depth"),
+         .module = vk_builtin_shader(frag[kind]),
          .pName = "main"}};
     VkPipelineVertexInputStateCreateInfo vi = {.sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO};
     VkPipelineInputAssemblyStateCreateInfo ia = {.sType = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO,
@@ -1106,13 +1124,15 @@ static VkPipeline resolve_pipeline(VkRenderPass rp, int kind) {  // kind 1 depth
     VkPipelineRasterizationStateCreateInfo rs = {.sType = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO,
                                                  .polygonMode = VK_POLYGON_MODE_FILL, .lineWidth = 1};
     VkPipelineMultisampleStateCreateInfo ms = {.sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO,
-                                               .rasterizationSamples = VK_SAMPLE_COUNT_1_BIT};
+                                               .rasterizationSamples = (VkSampleCountFlagBits)samples};
     VkStencilOpState so = {VK_STENCIL_OP_REPLACE, VK_STENCIL_OP_REPLACE, VK_STENCIL_OP_REPLACE, VK_COMPARE_OP_ALWAYS, 0xFF, 0xFF, 0};
     VkPipelineDepthStencilStateCreateInfo ds = {.sType = VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO,
-                                                .depthTestEnable = VK_TRUE, .depthWriteEnable = VK_TRUE,
-                                                .depthCompareOp = VK_COMPARE_OP_ALWAYS, .stencilTestEnable = kind == 2,
-                                                .front = so, .back = so};
-    VkPipelineColorBlendStateCreateInfo cb = {.sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO};
+                                                .depthTestEnable = kind != 3 && kind != 6, .depthWriteEnable = kind != 3 && kind != 6,
+                                                .depthCompareOp = VK_COMPARE_OP_ALWAYS,
+                                                .stencilTestEnable = kind == 2 || kind == 4 || kind == 5, .front = so, .back = so};
+    VkPipelineColorBlendAttachmentState all = {.colorWriteMask = kind == 6 ? 0x7 : 0xF};
+    VkPipelineColorBlendStateCreateInfo cb = {.sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO,
+                                              .attachmentCount = kind == 3 || kind == 6, .pAttachments = &all};
     VkDynamicState dyn[] = {VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR};
     VkPipelineDynamicStateCreateInfo dy = {.sType = VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO, .dynamicStateCount = 2,
                                            .pDynamicStates = dyn};
@@ -1161,7 +1181,7 @@ void vk_ms_resolve(TexBackend *b) {
         VkFormat f = b->ms_fmt, none = VK_FORMAT_UNDEFINED;
         bool sten = (r->aspect & VK_IMAGE_ASPECT_STENCIL_BIT) && g_vk.stencil_export;
         VkRenderPass rp = vk_render_pass(&none, 0, f, 1);
-        VkPipeline p = resolve_pipeline(rp, sten ? 2 : 1);
+        VkPipeline p = resolve_pipeline(rp, sten ? 2 : 1, 1);
         VkImageView dst = vk_image_view(b, VK_IMAGE_VIEW_TYPE_2D, f, 0, 1, 0, 1, id, b->aspect);
         if (!p || !dst) return;
         VkDescriptorSet set = vk_alloc_set(rs_set_layout);
@@ -1193,6 +1213,165 @@ void vk_ms_resolve(TexBackend *b) {
     gp_mark("  resolve");
 }
 
+// A pass that draws 3D models over a picture it did not clear: menus draw the hunter and Palicoes (Character Select,
+// Guild Card) straight into the finished picture, after the game's FXAA and outside the 3D scene's passes, so they
+// had no anti-aliasing. Such a target (TexBackend.ms_models: depth-writing draws went into it lately, the first ones
+// without MSAA) gets its picture copied into every sample of its multisampled image m as the frame's first pass of its
+// depth-testing draws begins (pass_models), which then renders with MSAA like the scene's passes. Its depth / stencil
+// target too, unless the pass clears it whole first (the smithy's preview draws over depth it doesn't clear). f: the
+// format the pass renders a colour target as. false: not possible (the pass goes without).
+static bool ms_expand(VkCommandBuffer cb, TexBackend *b, TexBackend *m, VkFormat f) {
+    static const VkComponentMapping id = {0};
+    bool depth = b->aspect & (VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT);
+    // (without stencil export, as vk_ms_resolve: depth only, the stencil set to 0)
+    bool sten = depth && (b->aspect & VK_IMAGE_ASPECT_STENCIL_BIT) && g_vk.stencil_export;
+    VkFormat none = VK_FORMAT_UNDEFINED;
+    VkRenderPass rp = depth ? vk_render_pass(&none, 0, m->format, m->samples) : vk_render_pass(&f, 1, none, m->samples);
+    VkPipeline p = resolve_pipeline(rp, !depth ? 3 : sten ? 5 : 4, m->samples);
+    VkImageView src = vk_image_view(b, VK_IMAGE_VIEW_TYPE_2D, depth ? b->format : f, 0, 1, 0, 1, id,
+                                    depth ? VK_IMAGE_ASPECT_DEPTH_BIT : VK_IMAGE_ASPECT_COLOR_BIT);
+    VkImageView src_s = sten ? vk_image_view(b, VK_IMAGE_VIEW_TYPE_2D, b->format, 0, 1, 0, 1, id, VK_IMAGE_ASPECT_STENCIL_BIT)
+                             : VK_NULL_HANDLE;
+    VkImageView dst = vk_image_view(m, VK_IMAGE_VIEW_TYPE_2D, depth ? m->format : f, 0, 1, 0, 1, id,
+                                    depth ? m->aspect : VK_IMAGE_ASPECT_COLOR_BIT);
+    if (!p || !src || !dst || (sten && !src_s)) return false;  // (kind 4: the stencil test writes reference 0)
+    VkDescriptorSet set = vk_alloc_set(rs_set_layout);
+    VkDescriptorImageInfo ii[2] = {{vk_default_sampler(false), src, VK_IMAGE_LAYOUT_GENERAL},
+                                   {vk_default_sampler(false), src_s, VK_IMAGE_LAYOUT_GENERAL}};
+    VkWriteDescriptorSet w[2] = {
+        {.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = set, .dstBinding = 0, .descriptorCount = 1,
+         .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, .pImageInfo = &ii[0]},
+        {.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = set, .dstBinding = 1, .descriptorCount = 1,
+         .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, .pImageInfo = &ii[1]}};
+    vkUpdateDescriptorSets(g_vk.dev, sten ? 2 : 1, w, 0, NULL);
+    VkRect2D area = {{0, 0}, {b->width, b->height}};
+    VkRenderPassBeginInfo bi = {.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO, .renderPass = rp,
+                                .framebuffer = vk_framebuffer(rp, &dst, 1, b->width, b->height), .renderArea = area};
+    vkCmdBeginRenderPass(cb, &bi, VK_SUBPASS_CONTENTS_INLINE);
+    vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, p);
+    vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, rs_layout, 0, 1, &set, 0, NULL);
+    VkViewport vp = {0, 0, (float)b->width, (float)b->height, 0, 1};
+    vkCmdSetViewport(cb, 0, 1, &vp);
+    vkCmdSetScissor(cb, 0, 1, &area);
+    vkCmdDraw(cb, 3, 1, 0, 0);
+    vkCmdEndRenderPass(cb);
+    vk_full_barrier(cb);
+    ss_forget();
+    gp_mark(depth ? "  MSAA: depth into the samples (3D models)" : "  MSAA: the picture into the samples (3D models over it)");
+    static bool logged;
+    if (!logged) logged = true, LOG("[vk] MSAA %ux for 3D models drawn over a finished %ux%u picture (menus)\n", m->samples,
+                                    b->width, b->height);
+    return true;
+}
+// The anti-aliasing such models get: the player's (models_aa), though every other anti-aliasing has run before they
+// are drawn. MSAA on: they are drawn through its samples (ms_expand; the 2D draws after them need per-sample shading,
+// sampleRateShading). FXAA on: FXAA 3.11 over them (models_fxaa_end). FSR never sees them (it runs at its start of
+// the HUD, before them): none, as with anti-aliasing off. full_picture: a picture they are drawn over: the render
+// size, once the game's FXAA pass drew this frame (before it, the 3D scene's passes, which keep their own rules).
+enum { MODELS_AA_NONE, MODELS_AA_MSAA, MODELS_AA_FXAA };
+static uint64_t aa_pass_frame;  // the frame the game's FXAA pass last drew in (fxaa_skipped)
+static int models_aa(void) {
+    if (g_fsr_on) return MODELS_AA_NONE;
+    if (g_vk.msaa > 1) return g_vk.sample_shading ? MODELS_AA_MSAA : MODELS_AA_NONE;
+    return config_live_fxaa() ? MODELS_AA_FXAA : MODELS_AA_NONE;
+}
+static bool full_picture(uint32_t w, uint32_t h) {
+    return models_aa() != MODELS_AA_NONE && aa_pass_frame == g_present_count && w == g_render_size[0] &&
+           h == g_render_size[1];
+}
+
+// FXAA over such models (MODELS_AA_FXAA): the picture is copied before each run of their depth-testing draws (and
+// depth clears) and again after it, then FXAA 3.11 is drawn into it from the second copy, only where the models
+// changed it and next to that ("fxaa.frag.models"), so the 2D draws around them stay sharp.
+static void snapshots_invalidate(NvnTexture *t);
+static NvnTexture *mf_tex;        // the picture of the run of models open (NULL none)
+static uint64_t mf_frame;         // the frame it opened in
+static TexBackend mf_before, mf_after;
+static bool picture_copy(TexBackend *b, TexBackend *d) {  // d: a copy of b (made as b's size and format)
+    VkCommandBuffer cb = vk_cmd();
+    if (d->image && (d->width != b->width || d->height != b->height || d->format != b->format)) {
+        vk_views_forget(d);
+        vk_defer_image(d->image, d->mem);
+        d->image = VK_NULL_HANDLE;
+    }
+    if (!d->image) {
+        VkImageCreateInfo ci = {.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO, .imageType = VK_IMAGE_TYPE_2D, .format = b->format,
+                                .extent = {b->width, b->height, 1}, .mipLevels = 1, .arrayLayers = 1,
+                                .samples = VK_SAMPLE_COUNT_1_BIT, .tiling = VK_IMAGE_TILING_OPTIMAL,
+                                .usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT};
+        VmaAllocationCreateInfo ai = {.usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE};
+        if (vmaCreateImage(g_vk.vma, &ci, &ai, &d->image, &d->mem, NULL) != VK_SUCCESS) return d->image = VK_NULL_HANDLE, false;
+        d->format = b->format; d->width = b->width; d->height = b->height; d->depth = d->layers = d->levels = d->samples = 1;
+        d->aspect = VK_IMAGE_ASPECT_COLOR_BIT; d->base_type = VK_IMAGE_VIEW_TYPE_2D;
+        vk_image_init_layout(cb, d->image, d->aspect);
+    }
+    vk_full_barrier(cb);
+    VkImageCopy rg = {.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, .dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
+                      .extent = {b->width, b->height, 1}};
+    vkCmdCopyImage(cb, b->image, VK_IMAGE_LAYOUT_GENERAL, d->image, VK_IMAGE_LAYOUT_GENERAL, 1, &rg);
+    vk_full_barrier(cb);
+    return true;
+}
+static void models_fxaa_begin(NvnTexture *t) {
+    vk_end_pass();
+    st.rt_dirty = true;
+    if (picture_copy(t->backend, &mf_before)) mf_tex = t, mf_frame = g_present_count;
+}
+static void models_fxaa_end(void) {
+    NvnTexture *t = mf_tex;
+    TexBackend *b = t->backend;
+    mf_tex = NULL;
+    vk_end_pass();
+    st.rt_dirty = true;
+    if (!picture_copy(b, &mf_after)) return;
+    static const VkComponentMapping id = {0};
+    VkFormat f = b->format;
+    VkRenderPass rp = vk_render_pass(&f, 1, VK_FORMAT_UNDEFINED, 1);
+    VkPipeline p = resolve_pipeline(rp, 6, 1);
+    VkImageView dst = vk_image_view(b, VK_IMAGE_VIEW_TYPE_2D, f, 0, 1, 0, 1, id, VK_IMAGE_ASPECT_COLOR_BIT);
+    VkImageView after = vk_image_view(&mf_after, VK_IMAGE_VIEW_TYPE_2D, f, 0, 1, 0, 1, id, VK_IMAGE_ASPECT_COLOR_BIT);
+    VkImageView before = vk_image_view(&mf_before, VK_IMAGE_VIEW_TYPE_2D, f, 0, 1, 0, 1, id, VK_IMAGE_ASPECT_COLOR_BIT);
+    if (!p || !dst || !after || !before) return;
+    VkCommandBuffer cb = vk_cmd();
+    VkDescriptorSet set = vk_alloc_set(rs_set_layout);
+    VkDescriptorImageInfo ii[2] = {{vk_default_sampler(true), after, VK_IMAGE_LAYOUT_GENERAL},
+                                   {vk_default_sampler(false), before, VK_IMAGE_LAYOUT_GENERAL}};
+    VkWriteDescriptorSet w[2] = {
+        {.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = set, .dstBinding = 0, .descriptorCount = 1,
+         .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, .pImageInfo = &ii[0]},
+        {.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = set, .dstBinding = 1, .descriptorCount = 1,
+         .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, .pImageInfo = &ii[1]}};
+    vkUpdateDescriptorSets(g_vk.dev, 2, w, 0, NULL);
+    VkRect2D area = {{0, 0}, {b->width, b->height}};
+    VkRenderPassBeginInfo bi = {.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO, .renderPass = rp,
+                                .framebuffer = vk_framebuffer(rp, &dst, 1, b->width, b->height), .renderArea = area};
+    vkCmdBeginRenderPass(cb, &bi, VK_SUBPASS_CONTENTS_INLINE);
+    vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, p);
+    vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, rs_layout, 0, 1, &set, 0, NULL);
+    VkViewport vp = {0, 0, (float)b->width, (float)b->height, 0, 1};
+    vkCmdSetViewport(cb, 0, 1, &vp);
+    vkCmdSetScissor(cb, 0, 1, &area);
+    vkCmdDraw(cb, 3, 1, 0, 0);
+    vkCmdEndRenderPass(cb);
+    vk_full_barrier(cb);
+    ss_forget();
+    snapshots_invalidate(t);
+    gp_mark("  FXAA over 3D models (menus)");
+    static bool logged;
+    if (!logged) logged = true, LOG("[vk] FXAA for 3D models drawn over a finished %ux%u picture (menus)\n", b->width, b->height);
+}
+// Before a draw or clear: models (it tests or clears depth) into a picture they are drawn over open a run, anything
+// else ends it. A run still open at the frame's end is dropped (the picture is presented without it).
+static void models_fxaa_track(bool models) {
+    if (models_aa() != MODELS_AA_FXAA) { mf_tex = NULL; return; }
+    if (mf_tex && mf_frame != g_present_count) mf_tex = NULL;
+    NvnTexture *t = st.rt.ncolor ? st.rt.color[0] : NULL;
+    TexBackend *b = t ? t->backend : NULL;
+    models = models && b && b->ms_models && b->ms_models + 2 >= g_present_count && full_picture(b->width, b->height);
+    if (mf_tex && !(models && t == mf_tex)) models_fxaa_end();
+    if (!mf_tex && models) models_fxaa_begin(t);
+}
+
 // Before a draw / dispatch: the textures it samples up to date (attachments of the pass: resolve_feedback).
 static NvnTexture *shader_texture_object(int stage, ShaderTexture *t);
 static void ms_resolve_sampled(int stage, ShaderInfo *si) {
@@ -1222,6 +1401,7 @@ static void begin_pass(void) {
         NvnTexture *t = st.rt.color[i];
         pass_color[i] = VK_FORMAT_UNDEFINED;
         if (!t) continue;
+        vk_rt_widen(t, vk_wide_rt_on() && !vk_fsr_input(t));  // (the game's own target: FSR 3 / 4 take no RGBA16 UNORM)
         if (g_fsr_on) {  // FSR: from the start of the HUD on, an output-size stand-in (fsr.c)
             NvnTexture *s = vk_fsr_map(t, false);
             if (s != t) pass_sx = (float)s->width / (float)t->width, pass_sy = (float)s->height / (float)t->height, t = s;
@@ -1265,18 +1445,39 @@ static void begin_pass(void) {
     pass_w = minw; pass_h = minh;
     ui_loading_pass = false;
     ui_title_pass = false;
+    ui_frontend_pass = false;
+    ui_stamp_pass = false;
     ui_results_pass = false;
+    ui_meownster_pass = false;
     ui_menu_pass = false;
     ui_nrecent = 0;
     pass_msaa = false;
+    // (MSAA: a colour target 3D models were drawn into lately (ms_expand), while they are; once they are not, it is like
+    // any other target again)
+    pass_models = false;
+    pass_want_depth = ms_want_depth;
+    for (uint32_t k = 0; k < nviews; k++) {
+        TexBackend *b = att[k];
+        if (att_index[k] < 0 || !b->ms_models) continue;
+        if (b->ms_models + 2 >= g_present_count) {
+            pass_models |= att_index[k] == 0 && models_aa() == MODELS_AA_MSAA && full_picture(minw, minh);
+            continue;
+        }
+        b->ms_models = 0;
+        vk_ms_resolve(b);
+        b->ms_valid = false;
+    }
     if (ms_ok && pass_depth != VK_FORMAT_UNDEFINED && minw == g_render_size[0] && minh == g_render_size[1]) {
         bool stencil = pass_depth == VK_FORMAT_D24_UNORM_S8_UINT || pass_depth == VK_FORMAT_D32_SFLOAT_S8_UINT;
         uint32_t cleared = leading_clears(minw, minh, stencil);
-        bool ok = true;
+        bool ok = true, expand[9] = {false};
         for (uint32_t k = 0; k < nviews && ok; k++) {
             TexBackend *b = att[k];
             bool clr = (cleared >> (att_index[k] < 0 ? 8 : att_index[k])) & 1;
-            ok = b->width == minw && b->height == minh && (clr || (b->ms && b->ms_valid && b->ms->samples == msaa));
+            bool valid = b->ms && b->ms_valid && b->ms->samples == msaa;
+            // (its picture, and the depth the models test against, into the samples first, as the models begin)
+            expand[k] = pass_models && pass_want_depth && !clr && !valid && (att_index[k] < 0 || b->ms_models);
+            ok = b->width == minw && b->height == minh && (clr || valid || expand[k]);
         }
         VkImageView msv[9];
         VkFormat ms_depth_fmt = pass_depth;
@@ -1286,6 +1487,8 @@ static void begin_pass(void) {
                                               (VkComponentMapping){0}, m->aspect));
             if (ok && att_index[k] < 0) ms_depth_fmt = m->format;
         }
+        for (uint32_t k = 0; k < nviews && ok; k++)
+            if (expand[k]) ok = ms_expand(cb, att[k], att[k]->ms, att_fmt[k]);
         if (ok) {  // rendered into the multisampled images (resolved at the end: vk_end_pass)
             memcpy(views, msv, nviews * sizeof *views);
             memcpy(pass_att, att, nviews * sizeof *att);
@@ -1297,6 +1500,9 @@ static void begin_pass(void) {
         }
     }
     for (uint32_t k = 0; k < nviews; k++) {
+        // (pass_models, its 2D draws before the models: they don't use the depth / stencil target, left as it is (a
+        // resolve of it is slow) and its multisampled image valid)
+        if (!pass_msaa && pass_models && !pass_want_depth && att_index[k] < 0) continue;
         if (!pass_msaa) vk_ms_resolve(att[k]);  // (rendered into directly: up to date first)
         att[k]->ms_valid = pass_msaa;
     }
@@ -1365,22 +1571,29 @@ static bool ui_preview_map(PreviewMap *pm) {
     *pm = (PreviewMap){0, 1, 0, 1};
     // The window it is drawn in: the last quad over the viewport (inside it sideways, not below it). The last quad of all
     // can be a button prompt under the window ("Rotate" under the Palico Scout preview), anchored apart from it.
-    int vanchor = ui_nrecent ? ui_recent[(ui_nrecent - 1) % UI_RECENT].vanchor : 1;
+    int vanchor = ui_nrecent ? ui_recent[(ui_nrecent - 1) % UI_RECENT].vanchor : 1, hanchor = -1;
     {
         float x0 = vp[0] / pw * 1280.0f, x1 = (vp[0] + w) / pw * 1280.0f, y1 = (fminf(vp[1], vp[1] + vp[3]) + h) / ph * 720.0f;
         for (uint32_t i = ui_nrecent; i > 0 && ui_nrecent - i < UI_RECENT; i--) {
             uint32_t k = (i - 1) % UI_RECENT;
-            if (ui_recent[k].x >= x0 && ui_recent[k].x <= x1 && ui_recent[k].y <= y1) { vanchor = ui_recent[k].vanchor; break; }
+            if (ui_recent[k].x >= x0 && ui_recent[k].x <= x1 && ui_recent[k].y <= y1) {
+                vanchor = ui_recent[k].vanchor, hanchor = ui_recent[k].hanchor;
+                break;
+            }
         }
     }
     if (asp > 16.0f / 9.0f) {
         float s = (16.0f / 9.0f) / asp;
-        float anchor = g_ui_anchor_aspect < asp ? g_ui_anchor_aspect : asp;
+        float ui = ui_frontend_pass ? 16.0f / 9.0f : g_ui_anchor_aspect;  // (front-end screens: as their HUD, cbuf_info)
+        float anchor = ui < asp ? ui : asp;
         float left_px = 640.0f * (1.0f - anchor / asp) * (pw / 1280.0f);
         float cx = (vp[0] + w * 0.5f) / pw * 1280.0f;
+        // sideways as its window went (the smithy's parchment, layer 100, goes Right: by its own place the model went
+        // Left, out of it), or by where it is when no window is over it
+        if (hanchor < 0) hanchor = cx <= 430.0f ? 0 : cx >= 650.0f ? 1 : 2;
         pm->kx = s;
-        if (cx <= 430.0f) pm->sx = left_px;
-        else if (cx >= 650.0f) pm->sx = pw - left_px - pw * s;
+        if (hanchor == 0) pm->sx = left_px;
+        else if (hanchor == 1) pm->sx = pw - left_px - pw * s;
         else pm->sx = pw * 0.5f * (1.0f - s);
     } else {
         float sy = asp / (16.0f / 9.0f);
@@ -1674,6 +1887,11 @@ volatile int g_clear_draw = -1;  // colour clears as draws (MHGU_CLEAR_DRAW, F9 
 
 static void clear(int index, int kind, const void *color, uint32_t mask, bool depth, float dval, bool stencil, uint32_t sval,
                   uint32_t smask) {
+    if (depth || stencil) {  // (MSAA, a picture 3D models are drawn into: their depth clear into the samples, pass_models)
+        ms_want_depth = true;
+        if (in_pass && pass_models && !pass_msaa && !pass_want_depth) st.rt_dirty = true;
+    }
+    models_fxaa_track(depth || stencil);  // (FXAA: the same, models_fxaa_end)
     begin_pass();
     if (g_dump_active) LOG("[dump]   clear %d mask %#x depth %d stencil %d (after %llu draws)\n", index, mask, depth, stencil,
                            (unsigned long long)(stat_draws - pass_draws_at));
@@ -2243,6 +2461,7 @@ typedef struct {
     uint8_t cull, front_ccw, prim_restart, depth_bias, depth_clamp;
     uint8_t depth_test, depth_write, depth_op, stencil_test;
     uint8_t sten_ops[2][4];  // per face: fail, pass, depth fail, compare
+    uint8_t sample_shading;  // (MSAA) every sample shaded (exec.c pass_models)
 } PipeKey;
 
 typedef struct Pipe {
@@ -2589,7 +2808,8 @@ static void build_pipeline(void *arg) {
                                                  .frontFace = k->front_ccw ? VK_FRONT_FACE_COUNTER_CLOCKWISE : VK_FRONT_FACE_CLOCKWISE,
                                                  .depthClampEnable = k->depth_clamp, .depthBiasEnable = k->depth_bias, .lineWidth = 1};
     VkPipelineMultisampleStateCreateInfo ms = {.sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO,
-                                               .rasterizationSamples = (VkSampleCountFlagBits)k->samples, .alphaToCoverageEnable = k->a2c};
+                                               .rasterizationSamples = (VkSampleCountFlagBits)k->samples, .alphaToCoverageEnable = k->a2c,
+                                               .sampleShadingEnable = k->sample_shading, .minSampleShading = 1};
     VkStencilOpState so[2];
     for (int f = 0; f < 2; f++)
         so[f] = (VkStencilOpState){(VkStencilOp)k->sten_ops[f][0], (VkStencilOp)k->sten_ops[f][1], (VkStencilOp)k->sten_ops[f][2],
@@ -2790,13 +3010,18 @@ static VkDescriptorBufferInfo cbuf_info(int stage, ShaderInfo *si, int k, uint32
                 // Layer 110 is the loading screen's scrolling backdrop: strips at y 168 / 433 / 570 that must stay one picture.
                 // The generic rule anchored each strip to a different edge and flattened it, leaving gaps between them.
                 // They keep their height (as on a stretched 16:9 canvas), so nothing moves vertically.
+                bool loading_strip = false;
                 if (fabsf(pos_z - 110.0f) < 0.5f) {
                     sy = 1.0f;
                     // (only the strips: the lock-on markers and other effects use layer 110 too, mid-hunt, and made
                     // everything after them center-anchored, so the HUD jumped down)
-                    if (fabsf(pos_y - 168.0f) < 0.3f || fabsf(pos_y - 433.0f) < 0.3f || fabsf(pos_y - 570.0f) < 0.3f) ui_loading_pass = true;
+                    loading_strip = fabsf(pos_y - 168.0f) < 0.3f || fabsf(pos_y - 433.0f) < 0.3f || fabsf(pos_y - 570.0f) < 0.3f;
+                    if (loading_strip) ui_loading_pass = true;
                 }
-                float anchor_aspect = g_ui_anchor_aspect;  // (config.c: 16:9 .. the screen's)
+                // Front-end screens keep their backdrop 16:9: the HUD stays on it as with the 16:9 anchor. Edges / 21:9 / 32:9
+                // took their centred menus (layer 100, x 640, anchored Right) and the help box (96) off it, to the sides.
+                if (fabsf(pos_z - 250.0f) < 0.5f && fabsf(pos_x - 640.0f) < 0.5f && fabsf(pos_y - 360.0f) < 0.5f) ui_frontend_pass = true;
+                float anchor_aspect = ui_frontend_pass ? 16.0f / 9.0f : g_ui_anchor_aspect;  // (config.c: 16:9 .. the screen's)
                 if (anchor_aspect > g_render_aspect) anchor_aspect = g_render_aspect;
                 float a_ratio = anchor_aspect / g_render_aspect;
                 float anchor_left = 640.0f * (1.0f - a_ratio);
@@ -2851,6 +3076,12 @@ static VkDescriptorBufferInfo cbuf_info(int stage, ShaderInfo *si, int k, uint32
                         // The Quest Complete banner's lower border slides in from y 739: it belongs to the bottom edge.
                         vanchor = pos_y > 650.0f ? V_BOTTOM : V_TOP;
                         if (fabsf(pos_z - 97.0f) < 0.5f) ui_menu_pass = true;
+                        // The Quest Complete stamp is one picture, after its borders (x 640, by the top and bottom edges; the
+                        // lower one slides in from y 739). Right / Left by place split it on a wide picture, its tilted
+                        // "QUEST" (x -17) left of the rest.
+                        if (fabsf(pos_z - 97.0f) < 0.5f && fabsf(pos_x - 640.0f) < 0.5f && (pos_y < 60.0f || pos_y > 680.0f))
+                            ui_stamp_pass = true;
+                        if (ui_stamp_pass) anchor = ANCHOR_CENTER;
                     } else if (fabsf(pos_z - 100.0f) < 0.5f) {
                         // 100.0: Hunter Arts HUD and bottom right prompts (y > 600) -> Bottom anchor
                         // Target cam selector (right edge, y 42..82: x > 1000, y < 360) -> Top anchor, so it stays by the minimap.
@@ -2896,10 +3127,26 @@ static VkDescriptorBufferInfo cbuf_info(int stage, ShaderInfo *si, int k, uint32
                     // parchment, the header went down). The bar is drawn after the stamp, so the last pass also tells.
                     if (fabsf(pos_z - 99.0f) < 0.5f && fabsf(pos_y - 643.0f) < 0.5f && (fabsf(pos_x - 80.0f) < 0.5f || fabsf(pos_x - 1180.0f) < 0.5f))
                         ui_results_pass = true;
-                    if ((ui_results_pass || ui_results_last) && pos_z > 98.5f && pos_z < 101.5f)
+                    // Sideways the middle is one table, centred (layer 100's Right took it right of the stamp it sits on, with
+                    // Edges / 21:9), and the header and page counter go to their side.
+                    if ((ui_results_pass || ui_results_last) && pos_z > 98.5f && pos_z < 101.5f) {
                         vanchor = pos_y < 60.0f ? V_TOP : pos_y > 600.0f ? V_BOTTOM : V_CENTER;
-
-                    if (anchor == ANCHOR_LEFT) {
+                        if (vanchor == V_CENTER) anchor = ANCHOR_CENTER;
+                        else if (vanchor == V_TOP) anchor = pos_x <= 430.0f ? ANCHOR_LEFT : pos_x >= 650.0f ? ANCHOR_RIGHT : ANCHOR_CENTER;
+                    }
+                    // Meownster Hunters return screen: a map in a black frame at the top (the frame on layers 105 and 100,
+                    // its corner at 215, 0; the map 105; its icons 102 / 103, bubbles 98), the Palicoes' tokens and the
+                    // reward list over it (100), the Reward List header and the prompts at the bottom. Layer 100 went to the
+                    // bottom with its rule: the tokens sat too low on the map, the lead Palico below the frame, and the
+                    // frame's lower edge slid away from it. All of it but the header and prompts (below y 600) goes top.
+                    if (fabsf(pos_z - 105.0f) < 0.5f && pos_x == 215.0f && pos_y == 0.0f) ui_meownster_pass = true;
+                    if (ui_meownster_pass && pos_z > 97.5f && pos_z < 105.5f) vanchor = pos_y > 600.0f ? V_BOTTOM : V_TOP;
+                    // The loading backdrop's tiles (x -30, 549, 1128...: one every 579, past 1280) are one picture sideways
+                    // too, from the screen's left edge: by place they went Left / Centre / Right, three copies with gaps
+                    // between them with Edges / 21:9; centred (or Center), nothing covered the left of the first tile.
+                    if (loading_strip) {
+                        new_pos_x = pos_x * s;
+                    } else if (anchor == ANCHOR_LEFT) {
                         new_pos_x = anchor_left + pos_x * s;
                     } else if (anchor == ANCHOR_RIGHT) {
                         new_pos_x = anchor_right - (1280.0f - pos_x) * s;
@@ -2909,6 +3156,7 @@ static VkDescriptorBufferInfo cbuf_info(int stage, ShaderInfo *si, int k, uint32
                     int v = vanchor == V_TOP ? 0 : vanchor == V_BOTTOM ? 2 : 1;
                     ui_recent[ui_nrecent % UI_RECENT].x = pos_x, ui_recent[ui_nrecent % UI_RECENT].y = pos_y;
                     ui_recent[ui_nrecent % UI_RECENT].vanchor = (uint8_t)v;
+                    ui_recent[ui_nrecent % UI_RECENT].hanchor = (uint8_t)anchor;
                     ui_nrecent++;
                     if (vanchor == V_TOP) new_pos_y = pos_y * sy;
                     else if (vanchor == V_BOTTOM) new_pos_y = 720.0f - (720.0f - pos_y) * sy;
@@ -3000,8 +3248,9 @@ static VkDescriptorSet stage_set(int nbinds, const VkBindingInfo *binds, VkDescr
             bi[n] = ubo_span(vk_transient_copy(base, sizeof base, 256), sizeof base);
             w[n].pBufferInfo = &bi[n];
         } else if (b->type == VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER && b->binding == 18) {  // rscale: no scaling here
-            float rs[66][4];
-            for (int k = 0; k < 66; k++) rs[k][0] = rs[k][1] = 1, rs[k][2] = rs[k][3] = 0;
+            float rs[67][4];
+            for (int k = 0; k < 67; k++) rs[k][0] = rs[k][1] = 1, rs[k][2] = rs[k][3] = 0;
+            memset(rs[66], 0xFF, 4);  // [66].x: the front-face mask's all-ones word (translate.c)
             bi[n] = ubo_span(vk_transient_copy(rs, sizeof rs, 256), sizeof rs);
             w[n].pBufferInfo = &bi[n];
         } else if (b->type == VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER && b->binding == ALPHA_REF_BUFFER_INDEX) {
@@ -3136,14 +3385,108 @@ static uint64_t prog_fs_hash(Prog *p) {
     return p->chash[1];
 }
 
-// FXAA off (settings): the game's FXAA pass (recognised by its shader) copies its input instead.
+// FXAA 3.11 (FXAAMode = 3_11): the game's FXAA pass draws shaders.c "fxaa.frag" instead, from the same input into the
+// same target. False: not possible, the game's own pass draws.
+static VkDescriptorSetLayout fxaa_set_layout;
+static VkPipelineLayout fxaa_layout;
+
+static VkPipeline fxaa_pipeline(VkRenderPass rp) {
+    static struct { VkRenderPass rp; VkPipeline p; } tab[8];
+    static int n;
+    for (int i = 0; i < n; i++) if (tab[i].rp == rp) return tab[i].p;
+    if (!fxaa_layout) {
+        VkDescriptorSetLayoutBinding b = {0, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_FRAGMENT_BIT, NULL};
+        VkDescriptorSetLayoutCreateInfo li = {.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO, .bindingCount = 1, .pBindings = &b};
+        VK_CHECK(vkCreateDescriptorSetLayout(g_vk.dev, &li, NULL, &fxaa_set_layout));
+        VkPipelineLayoutCreateInfo ci = {.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO, .setLayoutCount = 1,
+                                         .pSetLayouts = &fxaa_set_layout};
+        VK_CHECK(vkCreatePipelineLayout(g_vk.dev, &ci, NULL, &fxaa_layout));
+    }
+    VkPipelineShaderStageCreateInfo stages[2] = {
+        {.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, .stage = VK_SHADER_STAGE_VERTEX_BIT,
+         .module = vk_builtin_shader("resolve.vert"), .pName = "main"},
+        {.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, .stage = VK_SHADER_STAGE_FRAGMENT_BIT,
+         .module = vk_builtin_shader("fxaa.frag"), .pName = "main"}};
+    VkPipelineVertexInputStateCreateInfo vi = {.sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO};
+    VkPipelineInputAssemblyStateCreateInfo ia = {.sType = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO,
+                                                 .topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST};
+    VkPipelineViewportStateCreateInfo vs = {.sType = VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO, .viewportCount = 1,
+                                            .scissorCount = 1};
+    VkPipelineRasterizationStateCreateInfo rs = {.sType = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO,
+                                                 .polygonMode = VK_POLYGON_MODE_FILL, .lineWidth = 1};
+    VkPipelineMultisampleStateCreateInfo ms = {.sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO,
+                                               .rasterizationSamples = VK_SAMPLE_COUNT_1_BIT};
+    VkPipelineColorBlendAttachmentState att = {.colorWriteMask = 0xF};
+    VkPipelineColorBlendStateCreateInfo cb = {.sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO,
+                                              .attachmentCount = 1, .pAttachments = &att};
+    VkDynamicState dyn[] = {VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR};
+    VkPipelineDynamicStateCreateInfo dy = {.sType = VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO, .dynamicStateCount = 2,
+                                           .pDynamicStates = dyn};
+    VkGraphicsPipelineCreateInfo pi = {.sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO, .stageCount = 2,
+                                       .pStages = stages, .pVertexInputState = &vi, .pInputAssemblyState = &ia,
+                                       .pViewportState = &vs, .pRasterizationState = &rs, .pMultisampleState = &ms,
+                                       .pColorBlendState = &cb, .pDynamicState = &dy, .layout = fxaa_layout, .renderPass = rp};
+    VkPipeline p = VK_NULL_HANDLE;
+    if (vkCreateGraphicsPipelines(g_vk.dev, g_vk.pcache, 1, &pi, NULL, &p) != VK_SUCCESS) LOG("[vk] FXAA pipeline failed\n");
+    if (n < 8) tab[n].rp = rp, tab[n++].p = p;
+    return p;
+}
+
+static bool fxaa_311(NvnTexture *src) {
+    NvnTexture *dt = st.rt.color[0];
+    TexBackend *s = vk_tex(src, false), *d = vk_tex(dt, true);
+    if (s->samples != 1 || d->samples != 1) return false;
+    vk_end_pass();
+    st.rt_dirty = true;
+    vk_ms_resolve(s);
+    vk_ms_resolve(d);
+    bool has = st.rt.has_cview[0];
+    VkImageView sv = vk_view(src, NULL, false, false, TEXTYPE_2D), dv = vk_view(dt, &st.rt.cview[0], has, true, TEXTYPE_2D);
+    VkFormat f = has && (st.rt.cview[0].setmask & 4) && vk_format(dt->format) == d->format ? vk_format(st.rt.cview[0].format)
+                                                                                           : d->format;
+    VkRenderPass rp = vk_render_pass(&f, 1, VK_FORMAT_UNDEFINED, 1);
+    VkPipeline p = sv && dv ? fxaa_pipeline(rp) : VK_NULL_HANDLE;
+    if (!p) return false;
+    d->ms_valid = false;
+    renderer_mark_gpu_owned(dt);
+    uint32_t lv = has && (st.rt.cview[0].setmask & 1) ? st.rt.cview[0].base_level : 0;
+    uint32_t w = level_extent(d->width, lv), h = level_extent(d->height, lv);
+    VkCommandBuffer cb = vk_cmd();
+    vk_full_barrier(cb);
+    VkDescriptorSet set = vk_alloc_set(fxaa_set_layout);
+    VkDescriptorImageInfo ii = {vk_default_sampler(true), sv, VK_IMAGE_LAYOUT_GENERAL};
+    VkWriteDescriptorSet wr = {.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = set, .dstBinding = 0, .descriptorCount = 1,
+                               .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, .pImageInfo = &ii};
+    vkUpdateDescriptorSets(g_vk.dev, 1, &wr, 0, NULL);
+    VkRect2D area = {{0, 0}, {w, h}};
+    VkRenderPassBeginInfo bi = {.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO, .renderPass = rp,
+                                .framebuffer = vk_framebuffer(rp, &dv, 1, w, h), .renderArea = area};
+    vkCmdBeginRenderPass(cb, &bi, VK_SUBPASS_CONTENTS_INLINE);
+    vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, p);
+    vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, fxaa_layout, 0, 1, &set, 0, NULL);
+    VkViewport vp = {0, 0, (float)w, (float)h, 0, 1};
+    vkCmdSetViewport(cb, 0, 1, &vp);
+    vkCmdSetScissor(cb, 0, 1, &area);
+    vkCmdDraw(cb, 3, 1, 0, 0);
+    vkCmdEndRenderPass(cb);
+    ss_forget();
+    stat_draws++;
+    return true;
+}
+
+// FXAA off (settings): the game's FXAA pass (recognised by its shader) copies its input instead; FXAAMode = 3_11 draws
+// FXAA 3.11 there (fxaa_311).
 #define FXAA_FS_HASH 0x8530ded68f4407dfull
 static void copy_texture(const TexRef *src, const TexRef *dst, uint64_t flags);
 static bool fxaa_skipped(Prog *pr) {
-    if (config_live_fxaa() || prog_fs_hash(pr) != FXAA_FS_HASH || pr->fi->ntex != 1 || !st.rt.ncolor || !st.rt.color[0])
+    if (prog_fs_hash(pr) == FXAA_FS_HASH) aa_pass_frame = g_present_count;  // (menus: full_picture)
+    bool fxaa_311_on = config_live_fxaa() && config_live_fxaa_mode() == FXAA_311;
+    if ((config_live_fxaa() && !fxaa_311_on) || prog_fs_hash(pr) != FXAA_FS_HASH || pr->fi->ntex != 1 || !st.rt.ncolor ||
+        !st.rt.color[0])
         return false;
     NvnTexture *src = shader_texture_object(1, &pr->fi->tex[0]);
     if (!src || src == st.rt.color[0]) return false;
+    if (fxaa_311_on) return fxaa_311(src);
     TexRef s = {.tex = (uint64_t)(uintptr_t)src}, d = {.tex = (uint64_t)(uintptr_t)st.rt.color[0]};
     if (st.rt.has_cview[0]) d.view = st.rt.cview[0], d.has_view = 1;
     copy_texture(&s, &d, 0);
@@ -3205,11 +3548,15 @@ static void draw(CmdRec *r, bool indexed) {
     if (!native && mode != 6 && mode != 7 && mode != 9) { stat_skipped++; return; }
     if (g_fsr_on) {  // FSR: the frame's structure; at the start of the HUD FSR runs before this draw (fsr.c)
         FsrDraw fd = {.color0 = st.rt.ncolor ? st.rt.color[0] : NULL, .depth = st.rt.depth, .count = (uint32_t)r->x[2],
-                      .depth_write = st.ds[0] && st.ds[1], .vubuf = &st.ubuf[0][0].addr, .nvubuf = 18};
+                      .depth_write = st.ds[0] && st.ds[1], .vubuf = &st.ubuf[0][0].addr, .nvubuf = 18,
+                      .vp_w = st.viewport[0][2], .vp_h = st.viewport[0][3]};
         for (int i = 0; i < pr->fi->ntex && fd.ntex < 16; i++) fd.tex[fd.ntex++] = shader_texture_object(1, &pr->fi->tex[i]);
         vk_fsr_draw(&fd);
     }
 
+    ms_want_depth = st.ds[0] && st.rt.depth;  // (MSAA, a picture 3D models are drawn into: pass_models)
+    if (in_pass && pass_models && !pass_msaa && ms_want_depth && !pass_want_depth) st.rt_dirty = true;
+    models_fxaa_track(ms_want_depth);  // (FXAA: the same, models_fxaa_end)
     if (st.rt_dirty) vk_end_pass();  // (MSAA: the ending pass marks its targets for resolving before they are read)
     ms_resolve_sampled(0, pr->vi);
     ms_resolve_sampled(1, pr->fi);
@@ -3285,6 +3632,13 @@ static void draw(CmdRec *r, bool indexed) {
     k.depth_write = k.depth_test && st.ds[1];
     k.depth_op = (uint8_t)(k.depth_test ? compare_fn(st.ds[2]) : VK_COMPARE_OP_ALWAYS);
     k.stencil_test = st.ds[3] && has_stencil;
+    // (3D models drawn over the finished picture, without MSAA: from the next frame on, for as long as they are drawn,
+    // the player's anti-aliasing for them: ms_expand, models_fxaa_end)
+    if (k.depth_write) {
+        TexBackend *c0 = st.rt.ncolor && st.rt.color[0] ? st.rt.color[0]->backend : NULL;
+        if (c0 && (!pass_msaa || c0->ms_models) && full_picture(pass_w, pass_h)) c0->ms_models = g_present_count;
+    }
+    k.sample_shading = pass_msaa && pass_models && !k.depth_test;  // (the menu's 2D draws after the models: pass_models)
     if (k.stencil_test) {
         uint32_t ops = st.ds[5] | st.ds[6] << 8 | st.ds[7] << 16;
         for (int f = 0; f < 2; f++) {
@@ -3571,7 +3925,7 @@ static void copy_buffer_to_texture(uint64_t src, const TexRef *dst) {
     if (b->aspect == (VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT) || b->astc_bw) return;
     bool array = b->layers > 1 && b->depth == 1;
     uint32_t hb = ((uint32_t)rg[4] + fi->bh - 1) / fi->bh, wb = ((uint32_t)rg[3] + fi->bw - 1) / fi->bw;
-    uint32_t out_bpb = fi->bpb == 3 ? 4 : fi->bpb;
+    uint32_t out_bpb = b->wide ? 8 : fi->bpb == 3 ? 4 : fi->bpb;  // (wide: RGBA8 texels widened to RGBA16)
     uint32_t nz = (uint32_t)rg[5];
     if (!guest_range_ok(src, img * nz)) return;
     VkCommandBuffer cb = vk_cmd();
@@ -3583,6 +3937,7 @@ static void copy_buffer_to_texture(uint64_t src, const TexRef *dst) {
             const uint8_t *sr = (const uint8_t *)G2H((uint32_t)(src + (uint64_t)z * img + (uint64_t)y * row));
             uint8_t *dr = (uint8_t *)s.ptr + ((uint64_t)z * hb + y) * out_row;
             if (out_bpb == fi->bpb) memcpy(dr, sr, out_row);
+            else if (b->wide) for (uint32_t x = 0; x < wb * 4; x++) ((uint16_t *)dr)[x] = (uint16_t)(sr[x] * 257);
             else for (uint32_t x = 0; x < wb; x++) { memcpy(dr + x * 4, sr + x * 3, 3); dr[x * 4 + 3] = 255; }
         }
     VkBufferImageCopy c = {.bufferOffset = s.off, .bufferRowLength = wb * fi->bw, .bufferImageHeight = hb * fi->bh,
@@ -3612,7 +3967,7 @@ static void copy_texture_to_buffer(const TexRef *src, uint64_t dst) {
     if (!guest_range_ok(dst, total)) return;
     VkCommandBuffer cb = vk_cmd();
     vk_full_barrier(cb);
-    VkSpan out = vk_readback(total);
+    VkSpan out = vk_readback(b->wide ? total * 2 : total);  // (wide: RGBA16 read back, narrowed to the guest's RGBA8)
     VkBufferImageCopy c = {.bufferOffset = out.off, .bufferRowLength = (uint32_t)(row / fi->bpb) * fi->bw,
                            .bufferImageHeight = (uint32_t)(img / row) * fi->bh,
                            .imageSubresource = {b->aspect & VK_IMAGE_ASPECT_DEPTH_BIT ? VK_IMAGE_ASPECT_DEPTH_BIT : b->aspect,
@@ -3622,7 +3977,10 @@ static void copy_texture_to_buffer(const TexRef *src, uint64_t dst) {
     vkCmdCopyImageToBuffer(cb, b->image, VK_IMAGE_LAYOUT_GENERAL, out.buf, 1, &c);
     renderer_submit();  // the CPU may read the result right after the fence
     vk_wait_seq(submit_seq);
-    memcpy(G2H((uint32_t)dst), out.ptr, total);
+    if (b->wide) {
+        uint8_t *d = (uint8_t *)G2H((uint32_t)dst);
+        for (uint64_t i = 0; i < total; i++) d[i] = (uint8_t)((((const uint16_t *)out.ptr)[i] + 128) / 257);
+    } else memcpy(G2H((uint32_t)dst), out.ptr, total);
 }
 
 static void copy_texture(const TexRef *src, const TexRef *dst, uint64_t flags) {

@@ -23,11 +23,14 @@ Status: fully playable, but there may be some bugs. I've played a dozen hunts wi
 - Optional: village quests are playable in multiplayer (press L/R at the quest counter), with appropriately re-scaled monster HP
 - Mod support. The vast majority of mods work by dropping them into the `mods` folder, including Forge mods. (see [Mods](#mods))
 - Cheat codes in the same format as Ryujinx and Atmosphère, in the `cheats` folder (see [Cheats](#cheats))
-- Ingame PC Settings menu overlay (F1 to open, will be replaced with a real settings menu in the future)
+- Ingame PC Settings menu overlay (F1 or `Plus`+`Minus` to open, will be replaced with a real settings menu in the future)
+- Working online multiplayer servers, in public or with friends (use "Local Wireless" menu)
+- Discord Rich Presence: your Discord profile shows where you are, the quest's monsters and your party (can be turned off)
 
 ## Requirements
 
-- OS: Windows 10/11 64-bit, or Linux
+- OS: Windows 10/11 64-bit, or Linux 64-bit with glibc 2.39 or newer (Ubuntu 24.04, Linux Mint 22, Debian 13,
+  SteamOS 3.7, Arch, Fedora 40 or newer) and a Vulkan driver
 - CPU: Any CPU from 2014 or newer (needs AVX2 support)
 - GPU: Any GPU from 2016 or newer (needs Vulkan 1.2 support), and at least 1GB of VRAM
 - RAM: 4GB
@@ -108,25 +111,34 @@ To move an existing Switch save over, put its `system` and `system_backup` files
 
 Almost every controller under the sun should work, as long as it has SDL support. With more than one connected (a Steam Deck with a controller plugged in, say), press a button on the one you want to use. If you really want to swap the face buttons on non-Nintendo controllers, open the .ini file and set `FaceButtons = Label`.
 
-Keyboard and mouse support (not recommended):
+Keyboard and mouse support (not recommended). The default keys:
 
 | Key | Switch button |
 | --- | --- |
 | W A S D | left stick (hold Left Shift to walk) |
-| Mouse | right stick (camera) |
+| Mouse | camera |
 | Left click / Right click | X / A |
-| Space / R | B / Y |
+| Space / R or middle click | B / Y |
+| Mouse wheel | item bar: up = the item to the left, down = to the right (in a hunt, no need to hold L) |
 | Q / E | L / R |
 | Tab / T | ZL / ZR |
 | Enter / Backspace | Plus / Minus |
 | Arrow keys | d-pad |
 | Ctrl / Alt | left / right stick click |
 
-Click in the game window to capture the mouse for the camera; Escape lets it go (so does switching to another
-window). `MouseSensitivity` in the ini's `[Mouse]` section sets its speed; the game's own camera options (speed,
-inverted axes) apply to it too.
+Change them in Settings (F1), Controls, Keybinds: select a button, then Set key and press a key, click a mouse
+button (away from the menu's buttons) or turn the wheel, or Add a second key (each takes up to two). Item left /
+Item right turn the item bar one item per press (by default the wheel; any key works too). The wheel on any other
+button is a short press of it. They are kept in the ini's `[Keybinds]` section (`B = Space`, `Plus = Return, Keypad
+Enter`, `X = Mouse Left`, `ItemLeft = Wheel Up`; key names as the menu shows them, `None` for none). A key that does
+something else too shows red. Escape, Insert, F1 and F7 to F12 are the recomp's own and can't be used.
 
-When the game asks for text (names, chat), the keyboard types: Enter confirms, Escape cancels, Ctrl+V pastes.
+Click in the game window to capture the mouse for the camera; Escape lets it go (so does switching to another
+window). In a hunt the mouse turns the camera directly, like in a PC game: the same distance always turns it the same
+amount, however slowly you move. `MouseSensitivity` in the ini's `[Mouse]` section sets how far (1 = 0.08 degrees per
+mouse count); the game's inverted camera options apply to it too, its camera speed doesn't.
+
+When the game asks for text (names, chat), the keyboard types: Enter confirms, Escape cancels, Ctrl+V pastes. `/` opens a line of chat anywhere, also in a quest (where the game itself only has shoutouts): type (up to 120 characters), Enter sends it to everyone as a shoutout is sent, split between words into lines of the chat window, Escape cancels. While typing, the mouse drags the box elsewhere (kept in `chat_box.txt`). Change the key in Settings (F1), Controls, Keybinds, Chat key: it shows red when a keybind already uses that key.
 
 Other keys: F1 opens the settings menu, Alt+Enter or F11 switches between windowed and full screen, F12 takes a
 screenshot, F7 cycles MSAA.
@@ -142,7 +154,8 @@ anti-aliasing, VSync, controls and volume apply when you save; the settings mark
   `AspectRatio` (Auto follows the window: 16:10 and anything wider fill it, narrower gets 16:10 with bars), `FOV`
   (1.0 = the game's), `UIAnchor` (Center keeps the HUD in the middle 16:9 on an ultrawide screen, Edges spreads it
   to the sides)
-- `[Anti-aliasing]`: `MSAA` (Off / 2x / 4x / 8x), `FXAA` (On / Off)
+- `[Anti-aliasing]`: `MSAA` (Off / 2x / 4x / 8x), `FXAA` (On / Off), `FXAAMode` (Original / 3_11: FXAA 3.11 in
+  place of GU's FXAA, sharper textures; default Original)
 - `[Upscaler]`: `FSR` (Off / On, default Off), `FSRQuality` (NativeAA / Quality / Balanced / Performance /
   UltraPerformance), `Sharpness`, and `Upscaler` (FSR3, the default, or FSR4: needs an AMD RDNA 4 GPU and its driver, and an exe built with `make FSR4_DRIVER_PATCH=1`;
   falls back to FSR 3.1). FSR replaces MSAA and FXAA while it is on. Details: `docs/FSR-PORT.md`, `docs/FSR4-PORT.md`
@@ -168,12 +181,18 @@ anti-aliasing, VSync, controls and volume apply when you save; the settings mark
   original game)
 - `[Village Quests]`: `VillageQuestsInHub` (default On), `HubHP` (default 2.0: Village quests posted in the Hub
   multiply their monsters' HP by this first, then by the `[Monster HP]` factor)
+- `[Discord]`: `RichPresence` (default On: your Discord profile shows where you are, the monsters you're hunting
+  and the map, how many are in your hub or quest; Discord must be running on the same computer), `ShowHunter`
+  (default On: your hunter's name, HR and weapon type too)
 - `[Bonus Content]`: `BonusContent` (default On), see below
 - `[Audio]`: `Volume` (0 to 100: the whole game), `MuteInBackground` (On / Off, default Off: no sound while the
   game's window is in the background)
 - `[Application]`: `ConfirmExit` (ask before the window closes), and the settings menu's `Language` (English /
-  French / Spanish / German / Italian / Traditional_Chinese / Simplified_Chinese), `ButtonIcons` (Xbox / Switch / PlayStation) and `MenuScale` (100 to 200 percent), and `Updates` (Ask /
-  Auto / Off: what `mhgurecomp-updater` does, see "Staying up to date")
+  French / Spanish / German / Italian / Traditional_Chinese / Simplified_Chinese), `ButtonIcons` (Xbox / Switch / PlayStation), `Theme` (Hunter, the default / Gold / Blue: the settings menu's colours) and
+  `MenuScale` (50 to 200 percent), and `Updates` (Ask / Auto / Off: what `mhgurecomp-updater` does, see "Staying up
+  to date"). With the mouse, drag the top of the settings menu (its tabs) to move it, and the grip at its bottom right
+  corner to size it; Menu Options > Attach menu puts it back in place.
+
 
 ### Multiplayer
 
@@ -205,9 +224,13 @@ To install a mod, put the mod folder in `mods\`. Remove the folder to uninstall 
   off, moves them up or down, and writes `mods\load_order.txt` when Save is pressed (restart to apply; mods you add
   later load too, after the listed ones, until you turn them off; a mod turned off keeps its place in the order). It also compares the mods and lists the ones that change the same game files (and which of
   the two is used), and can apply a suggested order, with the mods that change the most files first.
-- exefs patches (`.pchtxt`, `.ips`) are applied when they change data. Patches to game code can't be applied, because
-  the code is precompiled; the log lists them.
-- Forge plugins (`.nro` in `romfs\nativeNX\plugins\`) are loaded. Forge's menu with the plugins' settings opens with
+- exefs patches (`.pchtxt`, `.ips` / IPS32) are applied, to data and to code. The game's code is precompiled, so a
+  function a patch changes runs in an interpreter instead (a little slower, only that function). A mod's own code
+  modules (`exefs\subsdk1` and so on, as in the
+  [MH4U Port](https://github.com/Scrimas/MH4U-port-to-MHGU)) are loaded and run in the interpreter too. The log says
+  what was patched and loaded (`[mods]` lines).
+- Forge plugins (`.nro` in `romfs\nativeNX\plugins\`) are loaded. Forge's own loader (the `exefs\subsdk9` that
+  Forge and mods with Forge plugins include) is not needed and is passed over: the port runs the plugins itself. Forge's menu with the plugins' settings opens with
   Insert (or the key in Forge's own `config.ini`, if a mod includes Forge's files, which can also set `[log] level`);
   use the mouse, keyboard or controller in it. While it is open the game gets no controller input. Window positions
   are kept in `forge_imgui.ini`.
@@ -222,7 +245,7 @@ If you are newer to the game, I very strongly recommend the [Key Quest Markers](
 
 ### Cheats
 
-Put `.txt` files with cheat codes in `cheats\`. Every cheat in them is on from the start. Codes made for Ryujinx or a
+Put `.txt` files with cheat codes in `cheats\`. Every cheat in them is on from the start, unless you turned it off. Codes made for Ryujinx or a
 modded Switch work as they are, as long as they are for version 1.4.0. A file can hold any number of cheats, each
 starting with its name in square brackets:
 
@@ -231,8 +254,12 @@ starting with its name in square brackets:
 04000000 000DFAB4 E1A00080
 ```
 
-- To turn off a file without deleting it, start its name with `_` (its cheats load in the off state).
-- The **Cheats** tab of the settings menu (F1, or Minus + Plus) lists all loaded cheats and lets you switch them on and off in real time (changes to game code and memory apply or revert cleanly at once, with no restart required). "Turn all cheats off" disables all cheats. Choices made in the menu are remembered in `cheats\cheats_state.ini`.
+- Turn single cheats on and off in the settings menu (F1), on the Cheats tab: it takes effect when you press Save,
+  without a restart, and is remembered in `cheats\_off.txt`. Turning off a cheat that changes the game's code puts
+  the original code back; values a cheat already changed (money, items) stay as they are. Master codes (`{Name}`)
+  are always on. Cheats added to the folder show up after a restart. Online, only use cheats when everyone in the
+  lobby agrees to it.
+- To turn off a file without deleting it, start its name with `_`.
 - Cheats that change the game's code also work: the port runs each changed function in an interpreter. That
   function runs slower, which only matters for functions the game calls very often.
 - `log.txt` lists the cheats it loaded, and any it couldn't read.
@@ -304,6 +331,7 @@ Useful targets and options:
 - `make clean`: removes the compiled files (`obj\` and the program files in `build\`). It keeps `build\data`.
 - `GENARCH=-march=x86-64-v2`: compiles the game code without AVX2, for older CPUs. Untested.
 - `FFMPEG=system`: links the system's FFmpeg libraries instead of building them (see below).
+- Linux: `SDL3=system`, `SHADERC=system`: link the system's SDL3 / shaderc instead of building them (see Linux).
 
 ### FFmpeg
 
@@ -327,15 +355,15 @@ make dist VERSION=0.10.4 BONUS=<path to the bonus savegame's system file>
 ```
 
 On Windows that writes `dist\Windows-MHGURecomp.0.10.4.zip`; on Linux (or in WSL, with `B=build-linux
-O=obj-linux`) `dist/ArchLinux-MHGURecomp.0.10.4.tar.gz`, which keeps the programs executable. Each holds one folder
+O=obj-linux`) `dist/Linux-MHGURecomp.0.10.4.tar.gz`, which keeps the programs executable. Each holds one folder
 with `mhgurecomp(.exe)`, `mhgugame.dll` / `.so`, `mhgurecomp-updater(.exe)`, the bundled DLLs, `licenses\`,
 `bonus\system` (from `BONUS`, else left empty), and empty `data\`, `mods\` and `cheats\` folders; never anything of
 the game's, or the build folder's settings, caches or mods. `make dist` prints each archive's SHA-256.
 
 Upload both archives to a GitHub release whose tag is exactly that version (`0.10.4`, no `v`), as a normal release,
 not a pre-release. The updater only looks at GitHub's "latest" release, compares its tag with its own version as
-numbers (0.10.10 is newer than 0.10.9), and picks the asset starting with `Windows-` (`.zip`) or `ArchLinux-`
-(`.tar.gz`, else `.zip`). GitHub records each upload's SHA-256, which the updater checks. To hold a broken release
+numbers (0.10.10 is newer than 0.10.9), and picks the asset starting with `Windows-` (`.zip`) or `Linux-`
+(`.tar.gz`, else `.zip`; `ArchLinux-`, the name up to 0.11.4, as well). GitHub records each upload's SHA-256, which the updater checks. To hold a broken release
 back, make it a draft or pre-release: the updater then sees the previous one as the latest.
 
 The version comes from `git describe --tags`. A build that isn't exactly a tag (`0.10.3-4-gabc1234`) never updates
@@ -359,9 +387,18 @@ The Windows build runs under Proton / Wine. A native Linux build is supported as
 x86_64 with clang under Wayland (NVIDIA). Besides `make`, `git`, `clang`, `lld` and Python 3.10 or newer it
 needs:
 
-- SDL3, the Vulkan loader and headers and shaderc — the same libraries the MSYS2 list above installs, under your
-  distro's names — plus `curl` and optionally `nasm` for building FFmpeg (see "FFmpeg" above; no FFmpeg package
-  needed);
+- the Vulkan loader and headers, plus `curl` and optionally `nasm` for building FFmpeg (see "FFmpeg" above; no
+  FFmpeg package needed);
+- `cmake` and the development files of what SDL uses on a desktop: X11 (with Xcursor, Xext, Xfixes, Xi, Xrandr,
+  Xss, Xtst), Wayland (wayland-protocols, libxkbcommon, libdecor), PipeWire, PulseAudio, ALSA, libudev and D-Bus.
+  Like FFmpeg, the first build downloads pinned releases of SDL3 and shaderc (with glslang and SPIRV-Tools) to
+  `third_party/`, checked against their SHA-256, and links them in statically, so the game runs on distributions
+  that have neither (Ubuntu 24.04 has no SDL3) and the release needs nothing besides glibc, libstdc++ and the
+  Vulkan loader. SDL still loads X11 / Wayland and the audio server from the system when it runs, and when the system
+  has an SDL3 of the same version or newer (new controllers, fixes), the game uses that one instead: `log.txt` says
+  which (`[ui] SDL ...`), and `MHGU_SDL=bundled` keeps the built-in one. That takes a few
+  minutes, once; the build stops if SDL didn't find one of those (`SDL3_NEED`). `make SDL3=system SHADERC=system`
+  links the system's `libSDL3.so.0` / `libshaderc_shared.so.1` instead, as a distribution package would;
 - `vk_mem_alloc.h` (3.4.0) in `third_party/vk_mem_alloc/`, which the Makefile has on the include path (a
   distro package that installs the header where the compiler looks by default works just as well);
 - `zenity` or `kdialog` for the dialog on a fatal error. Without either, the message goes to the terminal and
@@ -386,7 +423,9 @@ From Windows, the Linux build can be made in WSL with Arch Linux (`wsl --install
 Windows checkout, into its own folders so the Windows build is left alone:
 
 ```bash
-pacman -S --needed make git clang lld python sdl3 vulkan-headers vulkan-icd-loader shaderc nasm vulkan-swrast
+pacman -Syu --needed make git clang lld python cmake vulkan-headers vulkan-icd-loader nasm vulkan-swrast \
+    libx11 libxcursor libxext libxfixes libxi libxrandr libxss libxtst wayland wayland-protocols libxkbcommon \
+    libdecor pipewire libpulse alsa-lib systemd-libs dbus
 mkdir -p /usr/local/include/vma && cp /mnt/c/msys64/ucrt64/include/vma/vk_mem_alloc.h /usr/local/include/vma/
 make -j16 B=build-linux O=obj-linux     # in the repository, under /mnt/c/...
 ```

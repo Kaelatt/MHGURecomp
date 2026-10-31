@@ -5,10 +5,12 @@
 #include "overlay.h"
 #include "modorder.h"
 #include "imgui_internal.h"
+#include <SDL3/SDL.h>
 #include <cassert>
 #include <cstdio>
 #include <chrono>
 #include <cstdlib>
+#include <cstring>
 #include <iterator>
 #include <thread>
 #include <filesystem>
@@ -20,6 +22,18 @@ extern "C" void ui_request_action(bool restart) { requested = restart ? 2 : 1; }
 extern "C" bool ui_action_failed(void) { return false; }
 extern "C" int ldn_hub_status(const char *, const char *, int *, int *) { return 0; }
 extern "C" void ldn_hub_check(const char *, const char *) {}
+// (cheats.c: two cheats, a master code and one that can be turned off)
+static bool cheat_on[2] = {true, true};
+extern "C" int cheats_count(void) { return 2; }
+extern "C" const char *cheats_name(int i) { return i ? "Test cheat" : "Master"; }
+extern "C" const char *cheats_file(int i) { (void)i; return "test.txt"; }
+extern "C" bool cheats_master(int i) { return i == 0; }
+extern "C" bool cheats_on(int i) { return cheat_on[i]; }
+extern "C" bool cheats_set(const bool *on, int n, char *, size_t) {
+    for (int i = 0; i < n && i < 2; i++)
+        cheat_on[i] = on[i];
+    return true;
+}
 extern "C" int overlay_face_position(int semantic) {
     const int p[] = {1, 0, 3, 2};
     return p[semantic];
@@ -41,8 +55,9 @@ static void press(ImGuiKey key) {
     ImGui::GetIO().AddKeyEvent(key, false);
     idle();
 }
-static ImGuiID id(const char *name) {
-    auto *w = ImGui::FindWindowByName("Settings##main");
+static ImGuiID id(const char *name) {  // (a dropdown's choices are in a window of their own)
+    auto *w = ImGui::FindWindowByName(strncmp(name, "choice.", 7) ? "Settings##main" : "Settings##dropdown");
+    assert(w);
     return ImHashStr("###row", 0, ImHashStr(name, 0, w->ID));
 }
 static void selected(const char *name) {
@@ -154,6 +169,34 @@ int main() {
     selected("fps");
     io.AddKeyEvent(ImGuiKey_GamepadR1, false);
     idle();
+    // The frame rate: Confirm lists the common ones, left / right go a frame at a time
+    confirm();
+    selected("choice.1");  // (60, the one it has)
+    down();
+    confirm();
+    selected("fps");
+    press(ImGuiKey_GamepadDpadRight);
+    press(ImGuiKey_End);
+    press(ImGuiKey_GamepadDpadUp);
+    selected("save");
+    confirm();
+    assert(config_editable().fps == 91);
+    press(ImGuiKey_Home);
+    selected("fps");
+    confirm();
+    selected("choice.2");  // (91 is none of them: the one below)
+    press(ImGuiKey_GamepadDpadUp);
+    confirm();
+    press(ImGuiKey_End);
+    press(ImGuiKey_GamepadDpadUp);
+    confirm();
+    assert(config_editable().fps == 60);
+    press(ImGuiKey_Home);
+    confirm();
+    selected("choice.1");
+    back();  // (Back closes the dropdown, nothing changed)
+    selected("fps");
+    assert(!settings_panel_dirty() && opened);
     tab();
     selected("face");
     down();
@@ -174,6 +217,52 @@ int main() {
     press(ImGuiKey_GamepadDpadUp);
     confirm();
     assert(config_live_menu_confirm() == MENU_CONFIRM_ORIGINAL);
+    // The Keybinds submenu: a key chosen for B, then a mouse button as its second; the recomp's own keys refused
+    press(ImGuiKey_Home);
+    down(6);
+    selected("keybinds");
+    confirm();
+    selected("bind.0");  // (past the section's title)
+    down(6);             // (past the Buttons title)
+    selected("bind.6");
+    confirm();
+    selected("choice.0");  // Set key
+    confirm();
+    selected("capture.cancel");
+    assert(settings_panel_key(SDL_SCANCODE_F12));
+    idle();
+    selected("capture.cancel");  // (refused: still choosing)
+    assert(settings_panel_key(SDL_SCANCODE_G));
+    idle();
+    selected("bind.6");
+    confirm();
+    down();
+    selected("choice.1");  // Add a second key
+    confirm();
+    assert(settings_panel_mouse(SDL_BUTTON_MIDDLE));
+    idle();
+    selected("bind.6");
+    assert(!settings_panel_mouse(SDL_BUTTON_LEFT));  // (not choosing: a click is the menu's)
+    back();
+    selected("keybinds");
+    assert(settings_panel_dirty());
+    press(ImGuiKey_End);
+    press(ImGuiKey_GamepadDpadUp);
+    selected("save");
+    confirm();
+    assert(config_live_bind(BIND_B, 0) == SDL_SCANCODE_G && config_live_bind(BIND_B, 1) == KEY_MOUSE + SDL_BUTTON_MIDDLE);
+    press(ImGuiKey_Home);
+    down(6);
+    confirm();
+    press(ImGuiKey_End);
+    press(ImGuiKey_GamepadDpadUp);
+    selected("bind.reset");
+    confirm();
+    back();
+    press(ImGuiKey_End);
+    press(ImGuiKey_GamepadDpadUp);
+    confirm();
+    assert(config_live_bind(BIND_B, 0) == SDL_SCANCODE_SPACE && !config_live_bind(BIND_B, 1));
     tab();
     selected("port");
     press(ImGuiKey_GamepadL1);
@@ -278,7 +367,7 @@ int main() {
     tab();
     selected("display.mode");
     tab();
-    down(6);  // (fps, vsync, prewarm, msaa, fxaa, drawdist)
+    down(8);  // (fps, vsync, prewarm, msaa, fxaa, fxaamode, drawdist, smooth)
     selected("volume");
     confirm();
     selected("volume");
@@ -313,7 +402,7 @@ int main() {
     assert(!settings_panel_dirty());
     assert(config_editable().volume == 99);
     press(ImGuiKey_Home);
-    down(6);
+    down(8);
     selected("volume");
     press(ImGuiKey_GamepadDpadRight);
     back();
@@ -451,7 +540,7 @@ int main() {
     press(ImGuiKey_GamepadL1);
     press(ImGuiKey_GamepadL1);
     selected("fps");
-    down(8);  // (vsync, prewarm, msaa, fxaa, drawdist, volume, mutebg, fsr)
+    down(10);  // (vsync, prewarm, msaa, fxaa, fxaamode, drawdist, smooth, volume, mutebg, fsr)
     selected("fsr");
     confirm();
     assert(settings_panel_dirty());
@@ -475,7 +564,7 @@ int main() {
     opened = true;
     idle();
     selected("fps");
-    down(4);
+    down(5);
     selected("volume");
     assert(!settings_panel_dirty()); // FSR-owned AA rows are disabled, not misleading live toggles.
     idle(20);

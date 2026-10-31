@@ -8,7 +8,6 @@
 #include "overlay.h"
 #include "keymap.h"
 #include "modorder.h"
-#include "cheats_ui.h"
 #include "net/net.h"
 #include "imgui_internal.h"
 #include <SDL3/SDL.h>
@@ -943,24 +942,6 @@ void mods_rows(std::vector<Row> &r) {
         mods.scan.reset();
     });
 }
-// The Cheats tab: the cheats cheats.c loaded, switched on and off at once (no Save, no restart: cheats_set_enabled
-// applies and undoes their changes in memory, and remembers the choice in cheats/cheats_state.ini)
-void cheats_rows(std::vector<Row> &r) {
-    int n = cheats_count();
-    if (!n)
-        action(r, "cheats.none", tr("No cheats found in the cheats folder"), []() {});
-    for (int i = 0; i < n; ++i) {
-        Row row;
-        row.id = "cheat." + std::to_string(i);
-        row.title = std::string(cheats_master(i) ? "{" : "") + cheats_name(i) + (cheats_master(i) ? "}" : "");
-        row.value = tr(cheats_enabled(i) ? "On" : "Off");
-        row.adjust = [i](int d) { cheats_set_enabled(i, d > 0); };
-        row.activate = [i]() { cheats_set_enabled(i, !cheats_enabled(i)); };
-        r.push_back(std::move(row));
-    }
-    if (n)
-        action(r, "cheats.off", tr("Turn all cheats off"), []() { cheats_disable_all(); });
-}
 std::vector<Row> main_rows() {
     std::vector<Row> r;
     Config &c = s.draft;
@@ -1183,7 +1164,7 @@ std::vector<Row> main_rows() {
         break;
     case APP_PAGE:
         add_choice(r, "language", "Language", c.language, {"English", "Français", "Español", "Deutsch", "Italiano", "Traditional_Chinese", "Simplified_Chinese"},
-                   [](int v) { c.language = v; }, cold("Language"));
+                   [](int v) { c.language = v; }, ini("Language"));
         add_choice(r, "theme", "Menu theme", c.menu_theme, {tr("Gold"), tr("Blue"), tr("Hunter")},
                    [](int v) { c.menu_theme = v; }, ini("Theme"));
         number(r, "scale", "Interface scale (%)", &c.menu_scale, (int)lo("MenuScale"), (int)hi("MenuScale"), 10, ini("MenuScale"));

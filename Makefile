@@ -368,7 +368,6 @@ $(SHADERC_DIR)/lib/libshaderc_combined.a: $(SHADERC_DIR)/.built ;
 ifneq ($(FFMPEG),system)
 $(O)/rt/hle/movie.o: $(FFMPEG_DIR)/.built
 $(O)/rt/hle/movie.o: RTFLAGS += -I$(FFMPEG_DIR)/include
-$(O)/rt/settings_panel.o: runtime/cheats_ui.h
 endif
 
 # The licenses a copy of the game folder must carry, in $(B)/licenses: this program's own (LICENSE) and its
